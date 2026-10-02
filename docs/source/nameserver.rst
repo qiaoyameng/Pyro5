@@ -455,7 +455,7 @@ Your server has to register its Pyro objects with the name server. It first regi
 object with the Daemon, gets an URI back, and then registers that URI in the name server using
 the following method on the name server proxy:
 
-.. py:method:: register(name, uri, safe=False)
+.. py:method:: register(name, uri, safe=False, metadata=None, ttl=None)
 
     Registers an object (uri) under a logical name in the name server.
 
@@ -465,6 +465,33 @@ the following method on the name server proxy:
     :type uri: string or :class:`Pyro5.core.URI`
     :param safe: normally registering the same name twice silently overwrites the old registration. If you set safe=True, the same name cannot be registered twice.
     :type safe: bool
+    :param metadata: optional iterable of metadata tag strings
+    :type metadata: iterable of strings, optional
+    :param ttl: optional lease duration in seconds. A registration without TTL is permanent and the method returns ``None``. A TTL registration returns an opaque owner token.
+    :type ttl: number, optional
+
+Registrations without ``ttl`` keep the existing permanent behavior. When a ``ttl`` is provided, the server
+stores an absolute wall-clock expiry time and returns a random opaque owner token::
+
+    token = ns.register("worker.1", uri, ttl=30)
+
+The token is only returned from ``register``; it is not included in ``lookup``, ``list`` or metadata
+query results. A leased name must be renewed or released with both the exact name and token::
+
+    ns.renew("worker.1", token)
+    ns.renew("worker.1", token, ttl=60)
+    ns.release("worker.1", token)
+
+Replacing a name always creates a new lease and token. Renewals and releases using an old token cannot
+modify the replacement, including when a stale request arrives after the old lease has expired. Expired
+leases are invisible to ``lookup``, ``list`` (including prefix and regex filters) and ``yplookup``.
+They can be physically removed with ``cleanup_expired``; global cleanup removes all expired rows, while
+``cleanup_expired(name, token)`` only matches that exact name and token.
+
+With SQLite storage the expiry timestamp is an absolute POSIX wall-clock value persisted in the database,
+so time while the nameserver is stopped counts against the lease. If the system clock jumps forward, a
+lease may expire early. If it jumps backward before the expired row has been pruned, the still-stored
+lease may become visible again and can be renewed; calling ``cleanup_expired`` removes it permanently.
 
 You can unregister objects as well using the :py:meth:`unregister` method.
 The name server also supports automatically checking for registrations that are no longer available,

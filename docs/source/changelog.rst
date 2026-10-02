@@ -4,6 +4,7 @@ Change Log
 
 **Pyro 5.17**
 
+- Added optional TTL name registrations with opaque owner tokens; renewal and release require the name and token, and expired registrations are hidden from lookups and metadata queries.
 - Fixed slow ``locate_ns()`` on Windows: skipped reverse DNS lookup of 127.0.1.1 which caused 5+ second delays due to DNS timeout.
 - Fixed exception leaks in message handling (PR #116 by sgolev)
 - Fixed GC issue with daemon property

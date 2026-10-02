@@ -375,6 +375,98 @@ class TestOfflineNameServer:
             ns.list(regex="((((((broken")
         ns.storage.close()
 
+    def testTTLRegistrationExpiresAndIsNotListed(self):
+        self.clearStorage()
+        clock = [1000.0]
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, time_func=lambda: clock[0])
+        token = ns.register("lease.service", "PYRO:old@host:1111", ttl=10, metadata={"old"})
+        assert isinstance(token, str)
+        assert token
+        assert str(ns.lookup("lease.service")) == "PYRO:old@host:1111"
+        assert ns.lookup("lease.service", return_metadata=True) == (
+            Pyro5.core.URI("PYRO:old@host:1111"), {"old"}
+        )
+        assert ns.list() == {"lease.service": "PYRO:old@host:1111"}
+        assert ns.list(return_metadata=True)["lease.service"] == ("PYRO:old@host:1111", {"old"})
+        assert ns.list(prefix="lease.") == {"lease.service": "PYRO:old@host:1111"}
+        assert ns.list(regex="lease\\.") == {"lease.service": "PYRO:old@host:1111"}
+        assert ns.yplookup(meta_all={"old"}) == {
+            "lease.service": ("PYRO:old@host:1111", {"old"})
+        }
+        assert ns.count() == 1
+        clock[0] = 1009.0
+        assert ns.renew("lease.service", token) == 1019.0
+        clock[0] = 1019.0
+        assert ns.count() == 0
+        with pytest.raises(NamingError):
+            ns.lookup("lease.service")
+        with pytest.raises(NamingError):
+            ns.lookup("lease.service", return_metadata=True)
+        assert ns.list() == {}
+        assert ns.list(prefix="lease.") == {}
+        assert ns.list(regex="lease\\.") == {}
+        assert ns.yplookup(meta_all={"old"}) == {}
+        assert ns.cleanup_expired() == 1
+
+    def testTTLOperationsRequireMatchingToken(self):
+        self.clearStorage()
+        clock = [100.0]
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, time_func=lambda: clock[0])
+        token = ns.register("lease.service", "PYRO:lease@host:1111", ttl=10)
+        with pytest.raises(NamingError):
+            ns.renew("lease.service", token + "x")
+        with pytest.raises(NamingError):
+            ns.release("lease.service", token + "x")
+        with pytest.raises(NamingError):
+            ns.remove("lease.service")
+        assert str(ns.lookup("lease.service")) == "PYRO:lease@host:1111"
+        ns.release("lease.service", token)
+        assert ns.list() == {}
+
+    def testTTLReplacementInvalidatesOldToken(self):
+        self.clearStorage()
+        clock = [0.0]
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, time_func=lambda: clock[0])
+        old_token = ns.register("lease.service", "PYRO:old@host:1111", ttl=10, metadata={"old"})
+        clock[0] = 9.0
+        new_token = ns.register("lease.service", "PYRO:new@host:2222", ttl=100, metadata={"new"})
+        assert new_token != old_token
+        clock[0] = 11.0
+        with pytest.raises(NamingError):
+            ns.renew("lease.service", old_token)
+        with pytest.raises(NamingError):
+            ns.release("lease.service", old_token)
+        ns.cleanup_expired("lease.service", old_token)
+        ns.cleanup_expired()
+        assert str(ns.lookup("lease.service")) == "PYRO:new@host:2222"
+        assert ns.list() == {"lease.service": "PYRO:new@host:2222"}
+        assert ns.yplookup(meta_all={"new"}) == {
+            "lease.service": ("PYRO:new@host:2222", {"new"})
+        }
+        assert ns.renew("lease.service", new_token, ttl=200) == 211.0
+
+    def testPermanentRegistrationsKeepOriginalBehavior(self):
+        self.clearStorage()
+        clock = [0.0]
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, time_func=lambda: clock[0])
+        assert ns.register("permanent.service", "PYRO:permanent@host:1111", metadata={"tag"}) is None
+        clock[0] = 10_000_000.0
+        assert str(ns.lookup("permanent.service")) == "PYRO:permanent@host:1111"
+        assert ns.count() == 1
+        assert ns.remove("permanent.service") == 1
+        assert ns.list() == {}
+
+    def testTTLInvalidValue(self):
+        self.clearStorage()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        for ttl in (0, -1, float("nan"), float("inf"), True, "10"):
+            with pytest.raises((ValueError, TypeError)):
+                ns.register("lease.service", "PYRO:lease@host:1111", ttl=ttl)
+        token = ns.register("lease.service", "PYRO:lease@host:1111", ttl=10)
+        for ttl in (0, -1, float("nan"), float("inf"), True, "10"):
+            with pytest.raises((ValueError, TypeError)):
+                ns.renew("lease.service", token, ttl=ttl)
+
     def testNameserverWithStmt(self):
         ns = Pyro5.nameserver.NameServerDaemon(port=0)
         assert ns.nameserver is not None
@@ -658,3 +750,87 @@ class TestOfflineNameServerTestsSqlStorage(TestOfflineNameServer):
         import glob
         for file in glob.glob("pyro-test.sqlite*"):
             os.remove(file)
+
+    def testTTLRestartUsesStoredWallClockExpiry(self):
+        import glob
+        for file in glob.glob("pyro-test-restart.sqlite*"):
+            os.remove(file)
+        try:
+            ns = Pyro5.nameserver.NameServer(
+                Pyro5.nameserver.SqlStorage("pyro-test-restart.sqlite"),
+                time_func=lambda: 1000.0
+            )
+            ns.register("lease.service", "PYRO:lease@host:1111", ttl=10, metadata={"lease"})
+            ns.register("permanent.service", "PYRO:permanent@host:2222", metadata={"permanent"})
+            ns.storage.close()
+            ns = Pyro5.nameserver.NameServer(
+                Pyro5.nameserver.SqlStorage("pyro-test-restart.sqlite"),
+                time_func=lambda: 1009.0
+            )
+            assert str(ns.lookup("lease.service")) == "PYRO:lease@host:1111"
+            ns.storage.close()
+            ns = Pyro5.nameserver.NameServer(
+                Pyro5.nameserver.SqlStorage("pyro-test-restart.sqlite"),
+                time_func=lambda: 1010.0
+            )
+            with pytest.raises(NamingError):
+                ns.lookup("lease.service")
+            assert ns.list() == {"permanent.service": "PYRO:permanent@host:2222"}
+            assert ns.yplookup(meta_all={"permanent"}) == {
+                "permanent.service": ("PYRO:permanent@host:2222", {"permanent"})
+            }
+            ns.storage.close()
+            ns = Pyro5.nameserver.NameServer(
+                Pyro5.nameserver.SqlStorage("pyro-test-restart.sqlite"),
+                time_func=lambda: 1005.0
+            )
+            assert str(ns.lookup("lease.service")) == "PYRO:lease@host:1111"
+            ns.storage.close()
+        finally:
+            for file in glob.glob("pyro-test-restart.sqlite*"):
+                os.remove(file)
+
+    def testTTLCleanupDoesNotDeleteNewerSameNameRegistration(self):
+        import sqlite3
+        self.clearStorage()
+        dbfile = "pyro-test.sqlite"
+        with sqlite3.connect(dbfile) as db:
+            db.execute(
+                "INSERT INTO pyro_names(name, uri, token, expires_at, ttl) VALUES (?,?,?,?,?)",
+                ("lease.service", "PYRO:old@host:1111", "old-token", 110.0, 100.0)
+            )
+            old_id = db.execute("SELECT id FROM pyro_names WHERE token='old-token'").fetchone()[0]
+            db.execute(
+                "INSERT INTO pyro_names(name, uri, token, expires_at, ttl) VALUES (?,?,?,?,?)",
+                ("lease.service", "PYRO:new@host:2222", "new-token", 200.0, 100.0)
+            )
+            new_id = db.execute("SELECT id FROM pyro_names WHERE token='new-token'").fetchone()[0]
+            db.execute("INSERT INTO pyro_metadata(object, metadata) VALUES (?,?)", (old_id, "old"))
+            db.execute("INSERT INTO pyro_metadata(object, metadata) VALUES (?,?)", (new_id, "new"))
+            db.commit()
+        ns = Pyro5.nameserver.NameServer(
+            storageProvider=self.storageProvider,
+            time_func=lambda: 150.0
+        )
+        assert str(ns.lookup("lease.service")) == "PYRO:new@host:2222"
+        assert ns.yplookup(meta_all={"new"})["lease.service"][0] == "PYRO:new@host:2222"
+        assert ns.yplookup(meta_all={"old"}) == {}
+        assert ns.cleanup_expired("lease.service", "old-token") == 1
+        assert str(ns.lookup("lease.service")) == "PYRO:new@host:2222"
+        with sqlite3.connect(dbfile) as db:
+            assert db.execute("SELECT token FROM pyro_names ORDER BY id").fetchall() == [("new-token",)]
+
+        with sqlite3.connect(dbfile) as db:
+            db.execute(
+                "INSERT INTO pyro_names(name, uri, token, expires_at, ttl) VALUES (?,?,?,?,?)",
+                ("other.service", "PYRO:other@host:3333", "other-token", 140.0, 100.0)
+            )
+            db.execute(
+                "INSERT INTO pyro_names(name, uri, token, expires_at, ttl) VALUES (?,?,?,?,?)",
+                ("lease.service", "PYRO:oldest@host:1111", "oldest-token", 130.0, 100.0)
+            )
+            db.commit()
+        assert ns.cleanup_expired() == 2
+        assert str(ns.lookup("lease.service")) == "PYRO:new@host:2222"
+        with sqlite3.connect(dbfile) as db:
+            assert db.execute("SELECT token FROM pyro_names ORDER BY id").fetchall() == [("new-token",)]

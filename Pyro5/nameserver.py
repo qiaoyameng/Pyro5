@@ -12,6 +12,8 @@ import socket
 import time
 import contextlib
 import threading
+import secrets
+import math
 from collections.abc import MutableMapping
 try:
     import sqlite3
@@ -35,9 +37,65 @@ class MemoryStorage(dict):
     def __init__(self, **kwargs):
         super(MemoryStorage, self).__init__(**kwargs)
 
+    def __getitem__(self, item):
+        uri, metadata, token, expires_at, ttl = super(MemoryStorage, self).__getitem__(item)
+        return uri, metadata
+
     def __setitem__(self, key, value):
-        uri, metadata = value
-        super(MemoryStorage, self).__setitem__(key, (uri, metadata if metadata is not None else frozenset()))
+        if len(value) == 2:
+            uri, metadata = value
+            token = expires_at = ttl = None
+        elif len(value) == 5:
+            uri, metadata, token, expires_at, ttl = value
+        else:
+            raise ValueError("registration must contain uri and metadata, and optionally lease information")
+        super(MemoryStorage, self).__setitem__(key, (uri, metadata if metadata is not None else frozenset(), token, expires_at, ttl))
+
+    def put_registration(self, name, uri, metadata, token=None, expires_at=None, ttl=None):
+        self[name] = uri, metadata, token, expires_at, ttl
+
+    def get_lease(self, name):
+        uri, metadata, token, expires_at, ttl = super(MemoryStorage, self).__getitem__(name)
+        return token, expires_at, ttl
+
+    def active_names(self, now):
+        return {
+            name
+            for name, (uri, metadata, token, expires_at, ttl) in self.items()
+            if expires_at is None or expires_at > now
+        }
+
+    def renew_registration(self, name, token, now, expires_at, ttl):
+        try:
+            uri, metadata, current_token, current_expires, current_ttl = super().__getitem__(name)
+        except KeyError:
+            return False
+        if current_token != token or current_expires is None or current_expires <= now:
+            return False
+        self[name] = uri, metadata, token, expires_at, ttl if ttl is not None else current_ttl
+        return True
+
+    def remove_registration(self, name, token, now):
+        try:
+            current_token, expires_at, ttl = self.get_lease(name)
+        except KeyError:
+            return False
+        if current_token != token or expires_at is None or expires_at <= now:
+            return False
+        del self[name]
+        return True
+
+    def remove_expired_registrations(self, now, name=None, token=None):
+        if (name is None) != (token is None):
+            raise ValueError("name and token must both be provided")
+        expired = [
+            current_name
+            for current_name, (uri, metadata, current_token, expires_at, ttl) in self.items()
+            if expires_at is not None and expires_at <= now
+            and (name is None or current_name == name and current_token == token)
+        ]
+        self.remove_items(expired)
+        return len(expired)
 
     def optimized_prefix_list(self, prefix, return_metadata=False):
         return None
@@ -50,8 +108,8 @@ class MemoryStorage(dict):
 
     def everything(self, return_metadata=False):
         if return_metadata:
-            return self.copy()
-        return {name: uri for name, (uri, metadata) in self.items()}
+            return {name: (uri, metadata) for name, (uri, metadata, token, expires_at, ttl) in self.items()}
+        return {name: uri for name, (uri, metadata, token, expires_at, ttl) in self.items()}
 
     def remove_items(self, items):
         for item in items:
@@ -75,19 +133,36 @@ class SqlStorage(MutableMapping):
         with sqlite3.connect(dbfile) as db:
             db.execute("PRAGMA foreign_keys=ON")
             try:
-                db.execute("SELECT COUNT(*) FROM pyro_names").fetchone()
+                db.execute("SELECT token, expires_at, ttl FROM pyro_names LIMIT 1").fetchone()
             except sqlite3.OperationalError:
-                # the table does not yet exist
-                self._create_schema(db)
-            else:
-                # check if we need to update the existing schema
                 try:
                     db.execute("SELECT COUNT(*) FROM pyro_metadata").fetchone()
                 except sqlite3.OperationalError:
-                    # metadata schema needs to be created and existing data migrated
+                    try:
+                        db.execute("SELECT COUNT(*) FROM pyro_names").fetchone()
+                    except sqlite3.OperationalError:
+                        self._create_schema(db)
+                    else:
+                        db.execute("ALTER TABLE pyro_names RENAME TO pyro_names_old")
+                        self._create_schema(db)
+                        db.execute("INSERT INTO pyro_names(name, uri) SELECT name, uri FROM pyro_names_old")
+                        db.execute("DROP TABLE pyro_names_old")
+                else:
                     db.execute("ALTER TABLE pyro_names RENAME TO pyro_names_old")
+                    db.execute("ALTER TABLE pyro_metadata RENAME TO pyro_metadata_old")
                     self._create_schema(db)
-                    db.execute("INSERT INTO pyro_names(name, uri) SELECT name, uri FROM pyro_names_old")
+                    db.execute("""
+                        INSERT INTO pyro_names(name, uri, token, expires_at, ttl)
+                        SELECT name, uri, NULL, NULL, NULL FROM pyro_names_old
+                    """)
+                    db.execute("""
+                        INSERT INTO pyro_metadata(object, metadata)
+                        SELECT names.id, old_metadata.metadata
+                        FROM pyro_metadata_old old_metadata
+                        JOIN pyro_names_old old_names ON old_names.id = old_metadata.object
+                        JOIN pyro_names names ON names.name = old_names.name
+                    """)
+                    db.execute("DROP TABLE pyro_metadata_old")
                     db.execute("DROP TABLE pyro_names_old")
             db.commit()
 
@@ -95,14 +170,19 @@ class SqlStorage(MutableMapping):
         db.execute("""CREATE TABLE pyro_names
             (
                 id integer PRIMARY KEY,
-                name nvarchar NOT NULL UNIQUE,
-                uri nvarchar NOT NULL
+                name nvarchar NOT NULL,
+                uri nvarchar NOT NULL,
+                token nvarchar,
+                expires_at float,
+                ttl float
             );""")
+        db.execute("CREATE INDEX idx_pyro_names_name ON pyro_names(name)")
+        db.execute("CREATE INDEX idx_pyro_names_expires ON pyro_names(expires_at)")
         db.execute("""CREATE TABLE pyro_metadata
             (
                 object integer NOT NULL,
                 metadata nvarchar NOT NULL,
-                FOREIGN KEY(object) REFERENCES pyro_names(id)
+                FOREIGN KEY(object) REFERENCES pyro_names(id) ON DELETE CASCADE
             );""")
 
     def __getattr__(self, item):
@@ -111,7 +191,7 @@ class SqlStorage(MutableMapping):
     def __getitem__(self, item):
         try:
             with sqlite3.connect(self.dbfile) as db:
-                result = db.execute("SELECT id, uri FROM pyro_names WHERE name=?", (item,)).fetchone()
+                result = db.execute("SELECT id, uri FROM pyro_names WHERE name=? ORDER BY id DESC LIMIT 1", (item,)).fetchone()
                 if result:
                     dbid, uri = result
                     metadata = {m[0] for m in db.execute("SELECT metadata FROM pyro_metadata WHERE object=?", (dbid,)).fetchall()}
@@ -122,17 +202,21 @@ class SqlStorage(MutableMapping):
             raise NamingError("sqlite error in getitem: " + str(e))
 
     def __setitem__(self, key, value):
-        uri, metadata = value
+        if len(value) == 2:
+            uri, metadata = value
+            token = expires_at = ttl = None
+        elif len(value) == 5:
+            uri, metadata, token, expires_at, ttl = value
+        else:
+            raise ValueError("registration must contain uri and metadata, and optionally lease information")
         try:
             with sqlite3.connect(self.dbfile) as db:
                 cursor = db.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
-                dbid = cursor.execute("SELECT id FROM pyro_names WHERE name=?", (key,)).fetchone()
-                if dbid:
-                    dbid = dbid[0]
-                    cursor.execute("DELETE FROM pyro_metadata WHERE object=?", (dbid,))
-                    cursor.execute("DELETE FROM pyro_names WHERE id=?", (dbid,))
-                cursor.execute("INSERT INTO pyro_names(name, uri) VALUES(?,?)", (key, uri))
+                cursor.execute(
+                    "INSERT INTO pyro_names(name, uri, token, expires_at, ttl) VALUES(?,?,?,?,?)",
+                    (key, uri, token, expires_at, ttl)
+                )
                 if metadata:
                     object_id = cursor.lastrowid
                     for m in metadata:
@@ -141,6 +225,85 @@ class SqlStorage(MutableMapping):
                 db.commit()
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in setitem: " + str(e))
+
+    def put_registration(self, name, uri, metadata, token=None, expires_at=None, ttl=None):
+        self[name] = uri, metadata, token, expires_at, ttl
+
+    def get_lease(self, name):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                result = db.execute(
+                    "SELECT token, expires_at, ttl FROM pyro_names WHERE name=? ORDER BY id DESC LIMIT 1",
+                    (name,)
+                ).fetchone()
+                if result:
+                    return result
+                raise KeyError(name)
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in get_lease: " + str(e))
+
+    def active_names(self, now):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                rows = db.execute(
+                    """
+                    SELECT name FROM pyro_names n
+                    WHERE n.id=(SELECT MAX(id) FROM pyro_names n2 WHERE n2.name=n.name)
+                      AND (n.expires_at IS NULL OR n.expires_at > ?)
+                    """,
+                    (now,)
+                ).fetchall()
+                return {row[0] for row in rows}
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in active_names: " + str(e))
+
+    def renew_registration(self, name, token, now, expires_at, ttl=None):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                cursor = db.execute("""
+                    UPDATE pyro_names
+                    SET expires_at=?, ttl=COALESCE(?, ttl)
+                    WHERE name=? AND token=? AND expires_at IS NOT NULL AND expires_at > ?
+                      AND id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=pyro_names.name)
+                """, (expires_at, ttl, name, token, now))
+                db.commit()
+                return cursor.rowcount == 1
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in renew_registration: " + str(e))
+
+    def remove_registration(self, name, token, now):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                cursor = db.execute(
+                    """
+                    DELETE FROM pyro_names
+                    WHERE name=? AND token=? AND expires_at IS NOT NULL AND expires_at > ?
+                      AND id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=pyro_names.name)
+                    """,
+                    (name, token, now)
+                )
+                db.commit()
+                return cursor.rowcount == 1
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in remove_registration: " + str(e))
+
+    def remove_expired_registrations(self, now, name=None, token=None):
+        if (name is None) != (token is None):
+            raise ValueError("name and token must both be provided")
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                params = [now]
+                sql = "DELETE FROM pyro_names WHERE expires_at IS NOT NULL AND expires_at <= ?"
+                if name is not None:
+                    sql += " AND name=? AND token=?"
+                    params.extend((name, token))
+                cursor = db.execute(sql, params)
+                db.commit()
+                return cursor.rowcount
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in remove_expired_registrations: " + str(e))
 
     def __len__(self):
         try:
@@ -152,7 +315,10 @@ class SqlStorage(MutableMapping):
     def __contains__(self, item):
         try:
             with sqlite3.connect(self.dbfile) as db:
-                return db.execute("SELECT EXISTS(SELECT 1 FROM pyro_names WHERE name=? LIMIT 1)", (item,)).fetchone()[0]
+                return db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pyro_names n WHERE n.name=? AND n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name))",
+                    (item,)
+                ).fetchone()[0]
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in contains: " + str(e))
 
@@ -160,11 +326,7 @@ class SqlStorage(MutableMapping):
         try:
             with sqlite3.connect(self.dbfile) as db:
                 db.execute("PRAGMA foreign_keys=ON")
-                dbid = db.execute("SELECT id FROM pyro_names WHERE name=?", (key,)).fetchone()
-                if dbid:
-                    dbid = dbid[0]
-                    db.execute("DELETE FROM pyro_metadata WHERE object=?", (dbid,))
-                    db.execute("DELETE FROM pyro_names WHERE id=?", (dbid,))
+                db.execute("DELETE FROM pyro_names WHERE name=?", (key,))
                 db.commit()
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in delitem: " + str(e))
@@ -172,7 +334,10 @@ class SqlStorage(MutableMapping):
     def __iter__(self):
         try:
             with sqlite3.connect(self.dbfile) as db:
-                result = db.execute("SELECT name FROM pyro_names")
+                result = db.execute("""
+                    SELECT name FROM pyro_names n
+                    WHERE n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                """)
                 return iter([n[0] for n in result.fetchall()])
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in iter: " + str(e))
@@ -194,11 +359,20 @@ class SqlStorage(MutableMapping):
             with sqlite3.connect(self.dbfile) as db:
                 names = {}
                 if return_metadata:
-                    for dbid, name, uri in db.execute("SELECT id, name, uri FROM pyro_names WHERE name LIKE ?", (prefix + '%',)).fetchall():
+                    rows = db.execute("""
+                        SELECT n.id, n.name, n.uri FROM pyro_names n
+                        WHERE n.name LIKE ?
+                          AND n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    """, (prefix + '%',)).fetchall()
+                    for dbid, name, uri in rows:
                         metadata = {m[0] for m in db.execute("SELECT metadata FROM pyro_metadata WHERE object=?", (dbid,)).fetchall()}
                         names[name] = uri, metadata
                 else:
-                    for name, uri in db.execute("SELECT name, uri FROM pyro_names WHERE name LIKE ?", (prefix + '%',)).fetchall():
+                    for name, uri in db.execute("""
+                        SELECT n.name, n.uri FROM pyro_names n
+                        WHERE n.name LIKE ?
+                          AND n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    """, (prefix + '%',)).fetchall():
                         names[name] = uri
                 return names
         except sqlite3.DatabaseError as e:
@@ -214,14 +388,20 @@ class SqlStorage(MutableMapping):
                 if metadata_any:
                     # any of the given metadata
                     params = list(metadata_any)
-                    sql = "SELECT id, name, uri FROM pyro_names WHERE id IN (SELECT object FROM pyro_metadata WHERE metadata IN ({seq}))" \
+                    sql = """SELECT id, name, uri FROM (
+                        SELECT n.* FROM pyro_names n
+                        WHERE n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    ) WHERE id IN (SELECT object FROM pyro_metadata WHERE metadata IN ({seq}))""" \
                           .format(seq=",".join(['?'] * len(metadata_any)))
                 else:
                     # all of the given metadata
                     params = list(metadata_all)
                     params.append(len(metadata_all))
-                    sql = "SELECT id, name, uri FROM pyro_names WHERE id IN (SELECT object FROM pyro_metadata WHERE metadata IN ({seq}) " \
-                          "GROUP BY object HAVING COUNT(metadata)=?)".format(seq=",".join(['?'] * len(metadata_all)))
+                    sql = """SELECT id, name, uri FROM (
+                        SELECT n.* FROM pyro_names n
+                        WHERE n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    ) WHERE id IN (SELECT object FROM pyro_metadata WHERE metadata IN ({seq})
+                        GROUP BY object HAVING COUNT(metadata)=?)""".format(seq=",".join(['?'] * len(metadata_all)))
                 result = db.execute(sql, params).fetchall()
                 if return_metadata:
                     names = {}
@@ -239,7 +419,10 @@ class SqlStorage(MutableMapping):
             with sqlite3.connect(self.dbfile) as db:
                 db.execute("PRAGMA foreign_keys=ON")
                 for item in items:
-                    dbid = db.execute("SELECT id FROM pyro_names WHERE name=?", (item,)).fetchone()
+                    dbid = db.execute(
+                        "SELECT MAX(id) FROM pyro_names WHERE name=?",
+                        (item,)
+                    ).fetchone()
                     if dbid:
                         dbid = dbid[0]
                         db.execute("DELETE FROM pyro_metadata WHERE object=?", (dbid,))
@@ -253,11 +436,18 @@ class SqlStorage(MutableMapping):
             with sqlite3.connect(self.dbfile) as db:
                 names = {}
                 if return_metadata:
-                    for dbid, name, uri in db.execute("SELECT id, name, uri FROM pyro_names").fetchall():
+                    rows = db.execute("""
+                        SELECT n.id, n.name, n.uri FROM pyro_names n
+                        WHERE n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    """).fetchall()
+                    for dbid, name, uri in rows:
                         metadata = {m[0] for m in db.execute("SELECT metadata FROM pyro_metadata WHERE object=?", (dbid,)).fetchall()}
                         names[name] = uri, metadata
                 else:
-                    for name, uri in db.execute("SELECT name, uri FROM pyro_names").fetchall():
+                    for name, uri in db.execute("""
+                        SELECT n.name, n.uri FROM pyro_names n
+                        WHERE n.id=(SELECT MAX(id) FROM pyro_names latest WHERE latest.name=n.name)
+                    """).fetchall():
                         names[name] = uri
                 return names
         except sqlite3.DatabaseError as e:
@@ -273,24 +463,62 @@ class NameServer(object):
     Pyro name server. Provides a simple flat name space to map logical object names to Pyro URIs.
     Default storage is done in an in-memory dictionary. You can provide custom storage types.
     """
-    def __init__(self, storageProvider=None):
+    def __init__(self, storageProvider=None, time_func=None):
         self.storage = storageProvider
         if storageProvider is None:
             self.storage = MemoryStorage()
             log.debug("using volatile in-memory dict storage")
+        self.time_func = time_func or time.time
         self.lock = threading.RLock()
+
+    def _now(self):
+        return self.time_func()
+
+    def _get_lease(self, name):
+        if hasattr(self.storage, "get_lease"):
+            return self.storage.get_lease(name)
+        return None, None, None
+
+    def _active_names(self):
+        if hasattr(self.storage, "active_names"):
+            return self.storage.active_names(self._now())
+        return set(self.storage)
+
+    def _is_active(self, name):
+        token, expires_at, ttl = self._get_lease(name)
+        return expires_at is None or expires_at > self._now()
+
+    def _filter_active(self, result):
+        active_names = self._active_names()
+        return {name: value for name, value in result.items() if name in active_names}
+
+    def _validate_ttl(self, ttl):
+        if ttl is None:
+            return None
+        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("ttl must be a positive finite number of seconds")
+        return float(ttl)
+
+    def _new_token(self):
+        return secrets.token_urlsafe(32)
 
     def count(self):
         """Returns the number of name registrations."""
-        return len(self.storage)
+        with self.lock:
+            return len(self._active_names())
 
     def lookup(self, name, return_metadata=False):
         """
         Lookup the given name, returns an URI if found.
         Returns tuple (uri, metadata) if return_metadata is True.
         """
+        now = self._now()
         try:
-            uri, metadata = self.storage[name]
+            stored = self.storage[name]
+            uri, metadata = stored[0], stored[1]
+            token, expires_at, ttl = self._get_lease(name)
+            if expires_at is not None and expires_at <= now:
+                raise KeyError(name)
             uri = core.URI(uri)
             if return_metadata:
                 return uri, set(metadata or [])
@@ -298,9 +526,10 @@ class NameServer(object):
         except KeyError:
             raise NamingError("unknown name: " + name)
 
-    def register(self, name, uri, safe=False, metadata=None):
+    def register(self, name, uri, safe=False, metadata=None, ttl=None):
         """Register a name with an URI. If safe is true, name cannot be registered twice.
-        The uri can be a string or an URI object. Metadata must be None, or a collection of strings."""
+        The uri can be a string or an URI object. Metadata must be None, or a collection of strings.
+        If ttl is given, the registration expires after that number of seconds and an opaque owner token is returned."""
         if isinstance(uri, core.URI):
             uri = str(uri)
         elif not isinstance(uri, str):
@@ -312,10 +541,25 @@ class NameServer(object):
         if isinstance(metadata, str):
             raise TypeError("metadata should not be a str, but another iterable (set, list, etc)")
         metadata and iter(metadata)  # validate that metadata is iterable
+        ttl = self._validate_ttl(ttl)
         with self.lock:
-            if safe and name in self.storage:
+            if safe and name in self.storage and self._is_active(name):
                 raise NamingError("name already registered: " + name)
-            self.storage[name] = uri, set(metadata) if metadata is not None else None
+            token = None
+            expires_at = None
+            stored_ttl = None
+            if ttl is not None:
+                token = self._new_token()
+                expires_at = self._now() + ttl
+                stored_ttl = ttl
+            metadata = set(metadata) if metadata is not None else None
+            if hasattr(self.storage, "put_registration"):
+                self.storage.put_registration(name, uri, metadata, token, expires_at, stored_ttl)
+            elif ttl is not None:
+                raise NamingError("storage provider does not support ttl registrations")
+            else:
+                self.storage[name] = uri, metadata
+            return token
 
     def set_metadata(self, name, metadata):
         """update the metadata for an existing registration"""
@@ -326,34 +570,100 @@ class NameServer(object):
         metadata and iter(metadata)  # validate that metadata is iterable
         with self.lock:
             try:
-                uri, old_meta = self.storage[name]
-                self.storage[name] = uri, set(metadata) if metadata is not None else None
+                stored = self.storage[name]
+                uri = stored[0]
+                token, expires_at, ttl = self._get_lease(name)
+                if expires_at is not None and expires_at <= self._now():
+                    raise KeyError(name)
+                new_metadata = set(metadata) if metadata is not None else None
+                if hasattr(self.storage, "put_registration"):
+                    self.storage.put_registration(name, uri, new_metadata, token, expires_at, ttl)
+                else:
+                    self.storage[name] = uri, new_metadata
             except KeyError:
                 raise NamingError("unknown name: " + name)
 
-    def remove(self, name=None, prefix=None, regex=None):
+    def remove(self, name=None, prefix=None, regex=None, token=None):
         """Remove a registration. returns the number of items removed."""
         if name and name != core.NAMESERVER_NAME:
             with self.lock:
-                if name in self.storage:
-                    del self.storage[name]
+                if token is not None:
+                    self.release(name, token)
                     return 1
-                return 0
+                try:
+                    token, expires_at, ttl = self._get_lease(name)
+                except KeyError:
+                    return 0
+                if expires_at is not None:
+                    raise NamingError("ttl registration must be released with its owner token")
+                del self.storage[name]
+                return 1
         if prefix:
             with self.lock:
-                items = list(self.list(prefix=prefix).keys())
+                items = [
+                    item for item in self.list(prefix=prefix).keys()
+                    if self._get_lease(item)[1] is None
+                ]
                 if core.NAMESERVER_NAME in items:
                     items.remove(core.NAMESERVER_NAME)
                 self.storage.remove_items(items)
                 return len(items)
         if regex:
             with self.lock:
-                items = list(self.list(regex=regex).keys())
+                items = [
+                    item for item in self.list(regex=regex).keys()
+                    if self._get_lease(item)[1] is None
+                ]
                 if core.NAMESERVER_NAME in items:
                     items.remove(core.NAMESERVER_NAME)
                 self.storage.remove_items(items)
                 return len(items)
         return 0
+
+    def renew(self, name, token, ttl=None):
+        """Renew a TTL registration. The name and owner token must both match."""
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        if not isinstance(token, str):
+            raise TypeError("token must be a str")
+        ttl = self._validate_ttl(ttl)
+        with self.lock:
+            try:
+                current_token, expires_at, current_ttl = self._get_lease(name)
+            except KeyError:
+                raise NamingError("unknown or expired name: " + name)
+            if current_token != token or expires_at is None or expires_at <= self._now():
+                raise NamingError("unknown or expired name: " + name)
+            ttl = ttl if ttl is not None else current_ttl
+            expires_at = self._now() + ttl
+            if not self.storage.renew_registration(name, token, self._now(), expires_at, ttl):
+                raise NamingError("unknown or expired name: " + name)
+            return expires_at
+
+    def release(self, name, token):
+        """Explicitly release a TTL registration. The name and owner token must both match."""
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        if not isinstance(token, str):
+            raise TypeError("token must be a str")
+        with self.lock:
+            if not self.storage.remove_registration(name, token, self._now()):
+                raise NamingError("unknown or expired name: " + name)
+
+    def cleanup_expired(self, name=None, token=None):
+        """Delete expired records, optionally matching a name and owner token. Returns the number removed."""
+        if (name is None) != (token is None):
+            raise ValueError("name and token must both be provided")
+        if name is not None and (not isinstance(name, str) or not isinstance(token, str)):
+            raise TypeError("name and token must be strings")
+        with self.lock:
+            if not hasattr(self.storage, "remove_expired_registrations"):
+                return 0
+            return self.storage.remove_expired_registrations(self._now(), name, token)
+
+    refresh = renew
+    unregister = release
+    prune_expired = cleanup_expired
 
     # noinspection PyNoneFunctionAssignment
     def list(self, prefix=None, regex=None, return_metadata=False):
@@ -367,29 +677,29 @@ class NameServer(object):
             if prefix:
                 result = self.storage.optimized_prefix_list(prefix, return_metadata)
                 if result is not None:
-                    return result
+                    return self._filter_active(result)
                 result = {}
-                for name in self.storage:
+                for name, value in self.storage.everything(return_metadata=True).items():
                     if name.startswith(prefix):
-                        result[name] = self.storage[name] if return_metadata else self.storage[name][0]
-                return result
+                        result[name] = value if return_metadata else value[0]
+                return self._filter_active(result)
             elif regex:
                 result = self.storage.optimized_regex_list(regex, return_metadata)
                 if result is not None:
-                    return result
+                    return self._filter_active(result)
                 result = {}
                 try:
                     regex = re.compile(regex)
                 except re.error as x:
                     raise errors.NamingError("invalid regex: " + str(x))
                 else:
-                    for name in self.storage:
+                    for name, value in self.storage.everything(return_metadata=True).items():
                         if regex.match(name):
-                            result[name] = self.storage[name] if return_metadata else self.storage[name][0]
-                    return result
+                            result[name] = value if return_metadata else value[0]
+                    return self._filter_active(result)
             else:
                 # just return (a copy of) everything
-                return self.storage.everything(return_metadata)
+                return self._filter_active(self.storage.everything(return_metadata))
 
     # noinspection PyNoneFunctionAssignment
     def yplookup(self, meta_all=None, meta_any=None, return_metadata=True):
@@ -407,13 +717,13 @@ class NameServer(object):
                 meta_all and iter(meta_all)   # validate that metadata is iterable
                 result = self.storage.optimized_metadata_search(metadata_all=meta_all, return_metadata=return_metadata)
                 if result is not None:
-                    return result
+                    return self._filter_active(result)
                 meta_all = frozenset(meta_all)
                 result = {}
                 for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
                     if meta_all.issubset(meta):
                         result[name] = (uri, meta) if return_metadata else uri
-                return result
+                return self._filter_active(result)
             elif meta_any:
                 # return the entries which have any of the given metadata as part of their metadata
                 if isinstance(meta_any, str):
@@ -421,13 +731,13 @@ class NameServer(object):
                 meta_any and iter(meta_any)   # validate that metadata is iterable
                 result = self.storage.optimized_metadata_search(metadata_any=meta_any, return_metadata=return_metadata)
                 if result is not None:
-                    return result
+                    return self._filter_active(result)
                 meta_any = frozenset(meta_any)
                 result = {}
                 for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
                     if meta_any & meta:
                         result[name] = (uri, meta) if return_metadata else uri
-                return result
+                return self._filter_active(result)
             else:
                 return {}
 
@@ -545,6 +855,8 @@ class AutoCleaner(threading.Thread):
                 continue
             for name, uri in self.nameserver.list().items():
                 if name in (core.DAEMON_NAME, core.NAMESERVER_NAME):
+                    continue
+                if self.nameserver._get_lease(name)[1] is not None:
                     continue
                 try:
                     uri_obj = core.URI(uri)
