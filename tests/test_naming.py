@@ -35,6 +35,18 @@ class NSLoopThread(threading.Thread):
             pass  # ignore pyro communication errors
 
 
+class FakeClock:
+    """Deterministic replacement for time.time() to test TTL lease expiry."""
+    def __init__(self, start=1000000.0):
+        self.now = float(start)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 class TestBCSetup:
     @pytest.mark.network
     def testBCstart(self):
@@ -643,6 +655,202 @@ class TestOfflineNameServer:
             ns.list(prefix="a", regex="a")
         with pytest.raises(ValueError):
             ns.yplookup(meta_any={"a"}, meta_all={"a"})
+
+    def testTtlRegisterAndExpiry(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        token = ns.register("test.ttl", "PYRO:ttl@host:555", metadata={"meta.ttl"}, ttl=10)
+        assert isinstance(token, str) and len(token) > 0
+        assert ns.register("test.permanent", "PYRO:perm@host:555") is None  # permanent registrations return no token
+        assert str(ns.lookup("test.ttl")) == "PYRO:ttl@host:555"
+        assert "test.ttl" in ns.list()
+        assert ns.count() == 2
+        clock.advance(11)   # lease of test.ttl expires
+        # expired registration is invisible everywhere
+        with pytest.raises(NamingError):
+            ns.lookup("test.ttl")
+        with pytest.raises(NamingError):
+            ns.lookup("test.ttl", return_metadata=True)
+        assert "test.ttl" not in ns.list()
+        assert "test.ttl" not in ns.list(prefix="test")
+        assert "test.ttl" not in ns.list(regex=r"test\..*")
+        assert "test.ttl" not in ns.list(return_metadata=True)
+        assert "test.ttl" not in ns.yplookup(meta_any={"meta.ttl"})
+        assert "test.ttl" not in ns.yplookup(meta_all={"meta.ttl"})
+        assert ns.count() == 1
+        # the permanent registration is unaffected
+        assert str(ns.lookup("test.permanent")) == "PYRO:perm@host:555"
+        ns.storage.close()
+
+    def testTtlRenew(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        token = ns.register("test.ttl", "PYRO:ttl@host:555", ttl=10)
+        ns.register("test.permanent", "PYRO:perm@host:555")
+        with pytest.raises(NamingError):
+            ns.renew("test.ttl", "wrong-token", 10)
+        with pytest.raises(NamingError):
+            ns.renew("test.unknown", token, 10)
+        with pytest.raises(NamingError):
+            ns.renew("test.permanent", token, 10)   # not a leased registration
+        expires_at = ns.renew("test.ttl", token, 20)
+        assert expires_at == clock.now + 20
+        clock.advance(15)   # original ttl of 10 would have expired by now
+        assert str(ns.lookup("test.ttl")) == "PYRO:ttl@host:555"
+        clock.advance(10)   # now the renewed lease has expired as well
+        with pytest.raises(NamingError):
+            ns.lookup("test.ttl")
+        with pytest.raises(NamingError):
+            ns.renew("test.ttl", token, 10)   # cannot renew an expired lease
+        ns.storage.close()
+
+    def testTtlRelease(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        token = ns.register("test.ttl", "PYRO:ttl@host:555", ttl=100)
+        ns.register("test.permanent", "PYRO:perm@host:555")
+        assert ns.release("test.ttl", "wrong-token") is False
+        assert ns.release("test.unknown", token) is False
+        assert ns.release("test.permanent", token) is False   # permanent registrations have no lease to release
+        assert str(ns.lookup("test.ttl")) == "PYRO:ttl@host:555"
+        assert ns.release("test.ttl", token) is True
+        with pytest.raises(NamingError):
+            ns.lookup("test.ttl")
+        assert ns.release("test.ttl", token) is False   # already gone
+        ns.storage.close()
+
+    def testTtlReplacementInvalidatesOldToken(self):
+        # a new registration of the same name gets a new token, and the old lease/token
+        # must not be able to affect the new registration in any way
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        old_token = ns.register("test.service", "PYRO:old@host:555", ttl=10)
+        clock.advance(6)   # old lease is still valid at this point...
+        new_token = ns.register("test.service", "PYRO:new@host:555", ttl=10)   # ...but the name gets replaced
+        assert new_token != old_token
+        clock.advance(5)   # t=11: the old lease would have expired (at t=10), the new one is valid until t=16
+        # stale renew with the old token must fail and not touch the new registration
+        with pytest.raises(NamingError):
+            ns.renew("test.service", old_token, 100)
+        # stale release with the old token must fail and not remove the new registration
+        assert ns.release("test.service", old_token) is False
+        # a late cleanup of the expired old lease must not remove the new registration
+        assert ns.cleanup_expired() == 0
+        assert str(ns.lookup("test.service")) == "PYRO:new@host:555"
+        assert ns.count() == 1
+        # the new token is the one that works now
+        ns.renew("test.service", new_token, 10)
+        assert ns.release("test.service", new_token) is True
+        with pytest.raises(NamingError):
+            ns.lookup("test.service")
+        ns.storage.close()
+
+    def testTtlReplacementByPermanentRegistration(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        old_token = ns.register("test.service", "PYRO:old@host:555", ttl=10)
+        clock.advance(6)
+        assert ns.register("test.service", "PYRO:new@host:555") is None   # replace by a permanent registration
+        clock.advance(10)   # old lease is long expired
+        with pytest.raises(NamingError):
+            ns.renew("test.service", old_token, 10)
+        assert ns.release("test.service", old_token) is False
+        assert ns.cleanup_expired() == 0
+        assert str(ns.lookup("test.service")) == "PYRO:new@host:555"
+        ns.storage.close()
+
+    def testTtlCleanupExpired(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        ns.register("test.expired1", "PYRO:one@host:555", ttl=10)
+        ns.register("test.expired2", "PYRO:two@host:555", ttl=10)
+        ns.register("test.valid", "PYRO:three@host:555", ttl=100)
+        ns.register("test.permanent", "PYRO:four@host:555")
+        assert ns.cleanup_expired() == 0
+        clock.advance(11)
+        assert ns.cleanup_expired() == 2
+        # the expired registrations are really gone from storage, the others are untouched
+        assert "test.expired1" not in ns.storage
+        assert "test.expired2" not in ns.storage
+        assert "test.valid" in ns.storage
+        assert "test.permanent" in ns.storage
+        assert ns.count() == 2
+        assert ns.cleanup_expired() == 0   # already cleaned up
+        ns.storage.close()
+
+    def testTtlTokenNotInListResults(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        token = ns.register("test.ttl", "PYRO:ttl@host:555", metadata={"meta.ttl"}, ttl=100)
+        assert token not in str(ns.list())
+        assert token not in str(ns.list(return_metadata=True))
+        assert token not in str(ns.list(prefix="test", return_metadata=True))
+        assert token not in str(ns.list(regex="test.*", return_metadata=True))
+        assert token not in str(ns.yplookup(meta_any={"meta.ttl"}))
+        assert token not in str(ns.yplookup(meta_all={"meta.ttl"}))
+        uri, meta = ns.lookup("test.ttl", return_metadata=True)
+        assert token not in str(uri) and token not in str(meta)
+        ns.storage.close()
+
+    def testTtlSetMetadataKeepsLease(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        ns.register("test.ttl", "PYRO:ttl@host:555", metadata={"meta.one"}, ttl=10)
+        ns.set_metadata("test.ttl", {"meta.two"})
+        uri, meta = ns.lookup("test.ttl", return_metadata=True)
+        assert meta == {"meta.two"}
+        clock.advance(11)   # updating the metadata must not have turned it into a permanent registration
+        with pytest.raises(NamingError):
+            ns.lookup("test.ttl")
+        ns.storage.close()
+
+    def testTtlSafeRegisterAfterExpiry(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        ns.register("test.ttl", "PYRO:ttl@host:555", ttl=10)
+        with pytest.raises(NamingError):
+            ns.register("test.ttl", "PYRO:other@host:555", safe=True)
+        clock.advance(11)
+        # an expired registration no longer blocks a safe re-registration
+        ns.register("test.ttl", "PYRO:other@host:555", safe=True)
+        assert str(ns.lookup("test.ttl")) == "PYRO:other@host:555"
+        ns.storage.close()
+
+    def testTtlInvalidArguments(self):
+        clock = FakeClock()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider, clock=clock)
+        self.clearStorage()
+        with pytest.raises(ValueError):
+            ns.register("test.ttl", "PYRO:ttl@host:555", ttl=0)
+        with pytest.raises(ValueError):
+            ns.register("test.ttl", "PYRO:ttl@host:555", ttl=-5)
+        with pytest.raises(TypeError):
+            ns.register("test.ttl", "PYRO:ttl@host:555", ttl="10")
+        with pytest.raises(TypeError):
+            ns.register("test.ttl", "PYRO:ttl@host:555", ttl=True)
+        token = ns.register("test.ttl", "PYRO:ttl@host:555", ttl=10)
+        with pytest.raises(TypeError):
+            ns.renew("test.ttl", token, "10")
+        with pytest.raises(ValueError):
+            ns.renew("test.ttl", token, 0)
+        with pytest.raises(TypeError):
+            ns.renew("test.ttl", 1234, 10)
+        with pytest.raises(TypeError):
+            ns.renew(1234, token, 10)
+        with pytest.raises(TypeError):
+            ns.release("test.ttl", 1234)
+        with pytest.raises(TypeError):
+            ns.release(1234, token)
+        ns.storage.close()
 
 
 class TestOfflineNameServerTestsSqlStorage(TestOfflineNameServer):

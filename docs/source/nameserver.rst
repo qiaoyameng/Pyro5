@@ -467,6 +467,63 @@ the following method on the name server proxy:
     :type safe: bool
 
 You can unregister objects as well using the :py:meth:`unregister` method.
+
+
+.. index::
+    double: name server; TTL registrations
+
+.. _nameserver-ttl:
+
+Registrations with a TTL (leases)
+=================================
+Services that exit without cleanly unregistering themselves would normally leave a stale
+registration behind. To avoid this you can register a name with a time-to-live, creating a
+*leased* registration that expires automatically unless it is actively renewed:
+
+.. py:method:: register(name, uri, safe=False, metadata=None, ttl=None)
+
+    When ``ttl`` (a number of seconds) is given, the registration expires after that period
+    and the call returns an *opaque owner token* (a string). When ``ttl`` is omitted the
+    registration is permanent, behaves exactly as before, and the call returns ``None``.
+
+.. py:method:: renew(name, token, ttl)
+
+    Extend a leased registration. Both the name and the owner token must match the current
+    registration, and the lease must not have expired yet. Returns the new absolute expiry time.
+
+.. py:method:: release(name, token)
+
+    Explicitly remove a leased registration before it expires. Both the name and the owner
+    token must match the current registration. Returns True if something was removed.
+
+.. py:method:: cleanup_expired()
+
+    Remove all registrations whose lease has expired. Returns the number of removed registrations.
+    (The nameserver's autocleaner, when enabled via ``NS_AUTOCLEAN``, also does this periodically.)
+
+Some properties of leased registrations:
+
+- Re-registering an existing name always invalidates the previous lease: the old owner token
+  stops working and, if the new registration has a TTL of its own, a *new* token is issued.
+  A stale token can therefore never renew, release, or clean up a newer registration that
+  reused the same name.
+- Expired registrations are invisible: they don't show up in :py:meth:`lookup`,
+  :py:meth:`list` or the yellow-pages metadata queries, and are not counted.
+- The owner token is only ever returned by the ``register`` call itself; it never appears
+  in ``lookup``, ``list`` or yellow-pages results.
+
+**Time semantics, persistence and clock anomalies:**
+lease expiry is based on absolute wall-clock time (``time.time``), not on a monotonic clock,
+because expiry timestamps must remain comparable across restarts of the name server.
+With the SQLite persistent storage, leases survive a restart of the name server and still
+expire at their original absolute point in time -- so a lease that expires while the name
+server is down is expired (invisible, and removed on the next cleanup) when it comes back up.
+With the in-memory storage all registrations vanish on restart anyway.
+Because wall-clock time is used, clock anomalies affect the leases: if the system clock jumps
+backward, leases live longer than intended; if it jumps forward, leases can expire early.
+Keep the clock of the machine running the name server disciplined (e.g. via NTP).
+
+
 The name server also supports automatically checking for registrations that are no longer available,
 for instance because the server process crashed or a network problem occurs. It will then automatically
 remove those registrations after a certain timeout period.

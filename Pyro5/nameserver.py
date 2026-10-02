@@ -12,6 +12,7 @@ import socket
 import time
 import contextlib
 import threading
+import secrets
 from collections.abc import MutableMapping
 try:
     import sqlite3
@@ -34,10 +35,38 @@ class MemoryStorage(dict):
     """
     def __init__(self, **kwargs):
         super(MemoryStorage, self).__init__(**kwargs)
+        self.leases = {}    # name -> (token, expires_at)
 
     def __setitem__(self, key, value):
         uri, metadata = value
+        self.leases.pop(key, None)   # (re)registering a name invalidates any previous lease
         super(MemoryStorage, self).__setitem__(key, (uri, metadata if metadata is not None else frozenset()))
+
+    def __delitem__(self, key):
+        self.leases.pop(key, None)
+        super(MemoryStorage, self).__delitem__(key)
+
+    def clear(self):
+        self.leases.clear()
+        super(MemoryStorage, self).clear()
+
+    def register_lease(self, name, token, expires_at):
+        if name not in self:
+            raise KeyError(name)
+        self.leases[name] = (token, expires_at)
+
+    def lease(self, name):
+        return self.leases.get(name)
+
+    def expired_leases(self, now):
+        return [(name, token) for name, (token, expires_at) in self.leases.items() if expires_at <= now]
+
+    def delete_if_token(self, name, token):
+        lease = self.leases.get(name)
+        if lease is not None and lease[0] == token and name in self:
+            del self[name]
+            return True
+        return False
 
     def optimized_prefix_list(self, prefix, return_metadata=False):
         return None
@@ -89,6 +118,7 @@ class SqlStorage(MutableMapping):
                     self._create_schema(db)
                     db.execute("INSERT INTO pyro_names(name, uri) SELECT name, uri FROM pyro_names_old")
                     db.execute("DROP TABLE pyro_names_old")
+            self._ensure_lease_columns(db)
             db.commit()
 
     def _create_schema(self, db):
@@ -96,7 +126,9 @@ class SqlStorage(MutableMapping):
             (
                 id integer PRIMARY KEY,
                 name nvarchar NOT NULL UNIQUE,
-                uri nvarchar NOT NULL
+                uri nvarchar NOT NULL,
+                token nvarchar,
+                expires_at real
             );""")
         db.execute("""CREATE TABLE pyro_metadata
             (
@@ -104,6 +136,14 @@ class SqlStorage(MutableMapping):
                 metadata nvarchar NOT NULL,
                 FOREIGN KEY(object) REFERENCES pyro_names(id)
             );""")
+
+    def _ensure_lease_columns(self, db):
+        # databases created by older Pyro versions don't have the lease columns yet
+        columns = {row[1] for row in db.execute("PRAGMA table_info(pyro_names)").fetchall()}
+        if "token" not in columns:
+            db.execute("ALTER TABLE pyro_names ADD COLUMN token nvarchar")
+        if "expires_at" not in columns:
+            db.execute("ALTER TABLE pyro_names ADD COLUMN expires_at real")
 
     def __getattr__(self, item):
         raise NotImplementedError("SqlStorage doesn't implement method/attribute '" + item + "'")
@@ -248,6 +288,50 @@ class SqlStorage(MutableMapping):
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in remove_items: " + str(e))
 
+    def register_lease(self, name, token, expires_at):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                cursor = db.execute("UPDATE pyro_names SET token=?, expires_at=? WHERE name=?", (token, expires_at, name))
+                if cursor.rowcount == 0:
+                    raise KeyError(name)
+                db.commit()
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in register_lease: " + str(e))
+
+    def lease(self, name):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                result = db.execute("SELECT token, expires_at FROM pyro_names WHERE name=?", (name,)).fetchone()
+                if result and result[0] is not None:
+                    return result[0], result[1]
+                return None
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in lease: " + str(e))
+
+    def expired_leases(self, now):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                result = db.execute("SELECT name, token FROM pyro_names WHERE token IS NOT NULL AND expires_at <= ?", (now,))
+                return [(name, token) for name, token in result.fetchall()]
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in expired_leases: " + str(e))
+
+    def delete_if_token(self, name, token):
+        # only removes the registration if its current lease token matches,
+        # so a stale token can never delete a newer registration of the same name
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                dbid = db.execute("SELECT id FROM pyro_names WHERE name=? AND token=?", (name, token)).fetchone()
+                if not dbid:
+                    return False
+                db.execute("DELETE FROM pyro_metadata WHERE object=?", (dbid[0],))
+                db.execute("DELETE FROM pyro_names WHERE id=?", (dbid[0],))
+                db.commit()
+                return True
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in delete_if_token: " + str(e))
+
     def everything(self, return_metadata=False):
         try:
             with sqlite3.connect(self.dbfile) as db:
@@ -273,16 +357,20 @@ class NameServer(object):
     Pyro name server. Provides a simple flat name space to map logical object names to Pyro URIs.
     Default storage is done in an in-memory dictionary. You can provide custom storage types.
     """
-    def __init__(self, storageProvider=None):
+    def __init__(self, storageProvider=None, clock=None):
         self.storage = storageProvider
         if storageProvider is None:
             self.storage = MemoryStorage()
             log.debug("using volatile in-memory dict storage")
         self.lock = threading.RLock()
+        # time source used for lease expiry; injectable for testing. Must be wall-clock
+        # based (like time.time) because lease expiry timestamps are persisted and
+        # compared across restarts when using the sqlite storage.
+        self.clock = clock or time.time
 
     def count(self):
         """Returns the number of name registrations."""
-        return len(self.storage)
+        return len(self.storage) - len(self._expired_names())
 
     def lookup(self, name, return_metadata=False):
         """
@@ -291,6 +379,8 @@ class NameServer(object):
         """
         try:
             uri, metadata = self.storage[name]
+            if self._is_expired(name):
+                raise KeyError(name)
             uri = core.URI(uri)
             if return_metadata:
                 return uri, set(metadata or [])
@@ -298,9 +388,14 @@ class NameServer(object):
         except KeyError:
             raise NamingError("unknown name: " + name)
 
-    def register(self, name, uri, safe=False, metadata=None):
+    def register(self, name, uri, safe=False, metadata=None, ttl=None):
         """Register a name with an URI. If safe is true, name cannot be registered twice.
-        The uri can be a string or an URI object. Metadata must be None, or a collection of strings."""
+        The uri can be a string or an URI object. Metadata must be None, or a collection of strings.
+        If ttl (time-to-live, in seconds) is given, the registration is leased: it expires
+        automatically after that period unless it is renewed. In that case an opaque owner
+        token is returned that is required to renew() or release() the registration.
+        Permanent registrations (ttl=None, the default) behave as before and return None.
+        Re-registering an existing name always invalidates the previous lease and token."""
         if isinstance(uri, core.URI):
             uri = str(uri)
         elif not isinstance(uri, str):
@@ -312,10 +407,94 @@ class NameServer(object):
         if isinstance(metadata, str):
             raise TypeError("metadata should not be a str, but another iterable (set, list, etc)")
         metadata and iter(metadata)  # validate that metadata is iterable
+        if ttl is not None:
+            ttl = self._validate_ttl(ttl)
+            if not hasattr(self.storage, "register_lease"):
+                raise PyroError("the storage in use doesn't support TTL registrations")
         with self.lock:
-            if safe and name in self.storage:
+            if safe and name in self.storage and not self._is_expired(name):
                 raise NamingError("name already registered: " + name)
             self.storage[name] = uri, set(metadata) if metadata is not None else None
+            if ttl is None:
+                return None
+            token = secrets.token_hex(16)
+            self.storage.register_lease(name, token, self.clock() + ttl)
+            return token
+
+    def renew(self, name, token, ttl):
+        """
+        Renew a leased (TTL) registration. Both the name and the opaque owner token
+        (as returned by register) must match the current registration, and the lease
+        must not have expired yet. Returns the new absolute expiry time.
+        """
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        if not isinstance(token, str):
+            raise TypeError("token must be a str")
+        ttl = self._validate_ttl(ttl)
+        with self.lock:
+            lease = self._lease(name)
+            if lease is None or lease[0] != token or lease[1] <= self.clock():
+                raise NamingError("cannot renew lease for: " + name)
+            expires_at = self.clock() + ttl
+            self.storage.register_lease(name, token, expires_at)
+            return expires_at
+
+    def release(self, name, token):
+        """
+        Explicitly release a leased (TTL) registration before it expires.
+        Both the name and the opaque owner token must match the current registration.
+        Returns True if the registration was removed, False otherwise.
+        """
+        if not isinstance(name, str):
+            raise TypeError("name must be a str")
+        if not isinstance(token, str):
+            raise TypeError("token must be a str")
+        delete_if_token = getattr(self.storage, "delete_if_token", None)
+        if delete_if_token is None:
+            return False
+        with self.lock:
+            return delete_if_token(name, token)
+
+    def cleanup_expired(self):
+        """
+        Remove all registrations whose lease has expired. The token of every expired
+        lease is checked against the current registration before removing it, so a
+        late cleanup can never remove a newer registration that reused the same name.
+        Returns the number of registrations removed.
+        """
+        expired_leases = getattr(self.storage, "expired_leases", None)
+        delete_if_token = getattr(self.storage, "delete_if_token", None)
+        if expired_leases is None or delete_if_token is None:
+            return 0
+        removed = 0
+        with self.lock:
+            for name, token in expired_leases(self.clock()):
+                if delete_if_token(name, token):
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _validate_ttl(ttl):
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            raise TypeError("ttl must be a number of seconds")
+        if ttl <= 0:
+            raise ValueError("ttl must be a positive number of seconds")
+        return float(ttl)
+
+    def _lease(self, name):
+        lease = getattr(self.storage, "lease", None)
+        return lease(name) if lease is not None else None
+
+    def _is_expired(self, name):
+        lease = self._lease(name)
+        return lease is not None and lease[1] <= self.clock()
+
+    def _expired_names(self):
+        expired_leases = getattr(self.storage, "expired_leases", None)
+        if expired_leases is None:
+            return frozenset()
+        return {name for name, _token in expired_leases(self.clock())}
 
     def set_metadata(self, name, metadata):
         """update the metadata for an existing registration"""
@@ -327,9 +506,15 @@ class NameServer(object):
         with self.lock:
             try:
                 uri, old_meta = self.storage[name]
-                self.storage[name] = uri, set(metadata) if metadata is not None else None
             except KeyError:
                 raise NamingError("unknown name: " + name)
+            if self._is_expired(name):
+                raise NamingError("unknown name: " + name)
+            lease = self._lease(name)
+            self.storage[name] = uri, set(metadata) if metadata is not None else None
+            if lease is not None:
+                # writing the registration cleared the lease, restore it unchanged
+                self.storage.register_lease(name, lease[0], lease[1])
 
     def remove(self, name=None, prefix=None, regex=None):
         """Remove a registration. returns the number of items removed."""
@@ -360,42 +545,44 @@ class NameServer(object):
         """
         Retrieve the registered items as a dictionary name-to-URI. The URIs in the resulting dict
         are strings, not URI objects. You can filter by prefix or by regex.
+        Registrations with an expired TTL lease are not included.
         """
         if prefix and regex:
             raise ValueError("you can only filter on one thing at a time")
         with self.lock:
             if prefix:
                 result = self.storage.optimized_prefix_list(prefix, return_metadata)
-                if result is not None:
-                    return result
-                result = {}
-                for name in self.storage:
-                    if name.startswith(prefix):
-                        result[name] = self.storage[name] if return_metadata else self.storage[name][0]
-                return result
+                if result is None:
+                    result = {}
+                    for name in self.storage:
+                        if name.startswith(prefix):
+                            result[name] = self.storage[name] if return_metadata else self.storage[name][0]
             elif regex:
                 result = self.storage.optimized_regex_list(regex, return_metadata)
-                if result is not None:
-                    return result
-                result = {}
-                try:
-                    regex = re.compile(regex)
-                except re.error as x:
-                    raise errors.NamingError("invalid regex: " + str(x))
-                else:
-                    for name in self.storage:
-                        if regex.match(name):
-                            result[name] = self.storage[name] if return_metadata else self.storage[name][0]
-                    return result
+                if result is None:
+                    result = {}
+                    try:
+                        regex = re.compile(regex)
+                    except re.error as x:
+                        raise errors.NamingError("invalid regex: " + str(x))
+                    else:
+                        for name in self.storage:
+                            if regex.match(name):
+                                result[name] = self.storage[name] if return_metadata else self.storage[name][0]
             else:
                 # just return (a copy of) everything
-                return self.storage.everything(return_metadata)
+                result = self.storage.everything(return_metadata)
+            expired = self._expired_names()
+            if expired:
+                result = {name: value for name, value in result.items() if name not in expired}
+            return result
 
     # noinspection PyNoneFunctionAssignment
     def yplookup(self, meta_all=None, meta_any=None, return_metadata=True):
         """
         Do a yellow-pages lookup for registrations that have all or any of the given metadata tags.
         By default returns the actual metadata in the result as well.
+        Registrations with an expired TTL lease are not included.
         """
         if meta_all and meta_any:
             raise ValueError("you can't use meta_all or meta_any at the same time")
@@ -406,30 +593,30 @@ class NameServer(object):
                     raise TypeError("metadata_all should not be a str, but another iterable (set, list, etc)")
                 meta_all and iter(meta_all)   # validate that metadata is iterable
                 result = self.storage.optimized_metadata_search(metadata_all=meta_all, return_metadata=return_metadata)
-                if result is not None:
-                    return result
-                meta_all = frozenset(meta_all)
-                result = {}
-                for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
-                    if meta_all.issubset(meta):
-                        result[name] = (uri, meta) if return_metadata else uri
-                return result
+                if result is None:
+                    meta_all = frozenset(meta_all)
+                    result = {}
+                    for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
+                        if meta_all.issubset(meta):
+                            result[name] = (uri, meta) if return_metadata else uri
             elif meta_any:
                 # return the entries which have any of the given metadata as part of their metadata
                 if isinstance(meta_any, str):
                     raise TypeError("metadata_any should not be a str, but another iterable (set, list, etc)")
                 meta_any and iter(meta_any)   # validate that metadata is iterable
                 result = self.storage.optimized_metadata_search(metadata_any=meta_any, return_metadata=return_metadata)
-                if result is not None:
-                    return result
-                meta_any = frozenset(meta_any)
-                result = {}
-                for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
-                    if meta_any & meta:
-                        result[name] = (uri, meta) if return_metadata else uri
-                return result
+                if result is None:
+                    meta_any = frozenset(meta_any)
+                    result = {}
+                    for name, (uri, meta) in self.storage.everything(return_metadata=True).items():
+                        if meta_any & meta:
+                            result[name] = (uri, meta) if return_metadata else uri
             else:
                 return {}
+            expired = self._expired_names()
+            if expired:
+                result = {name: value for name, value in result.items() if name not in expired}
+            return result
 
     def ping(self):
         """A simple test method to check if the name server is running correctly."""
@@ -543,6 +730,8 @@ class AutoCleaner(threading.Thread):
             time_since_last_autoclean = time.time() - self.last_cleaned
             if time_since_last_autoclean < config.NS_AUTOCLEAN:
                 continue
+            # first get rid of registrations whose TTL lease expired
+            self.nameserver.cleanup_expired()
             for name, uri in self.nameserver.list().items():
                 if name in (core.DAEMON_NAME, core.NAMESERVER_NAME):
                     continue

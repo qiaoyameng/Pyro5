@@ -2,6 +2,13 @@
 Change Log
 **********
 
+**Pyro 5.18 (unreleased)**
+
+- Added optional TTL (leased) name registrations to the name server: ``register`` with a ``ttl``
+  returns an opaque owner token required by the new ``renew`` and ``release`` methods.
+  Expired registrations are invisible and are reaped by ``cleanup_expired`` (also called by
+  the autocleaner); re-registering a name invalidates the previous token.
+
 **Pyro 5.17**
 
 - Fixed slow ``locate_ns()`` on Windows: skipped reverse DNS lookup of 127.0.1.1 which caused 5+ second delays due to DNS timeout.
