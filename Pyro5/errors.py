@@ -63,6 +63,26 @@ class SerializeError(ProtocolError):
     pass
 
 
+class OrderedOnewayError(PyroError):
+    """An ordered one-way channel encountered a problem."""
+    pass
+
+
+class OrderedOnewayUnsupportedError(OrderedOnewayError):
+    """The peer does not support ordered one-way channels."""
+    pass
+
+
+class OrderedOnewayQueueFullError(OrderedOnewayError):
+    """The ordered one-way channel queue is full."""
+    pass
+
+
+class OrderedOnewayChannelClosedError(OrderedOnewayError):
+    """The ordered one-way channel is closed."""
+    pass
+
+
 def get_pyro_traceback(ex_type=None, ex_value=None, ex_tb=None):
     """Returns a list of strings that form the traceback information of a
     Pyro exception. Any remote Pyro exception information is included.

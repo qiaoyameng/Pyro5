@@ -529,3 +529,31 @@ Also this enables a properly working ``hasattr`` on the proxy, and efficient and
 if you try to access a method or attribute that is not defined or not exposed on the Pyro object.
 Lastly the direct access to attributes on the remote object is also made possible, because the proxy knows about what
 attributes are available.
+
+
+Ordered oneway channels
+=======================
+
+Regular oneway calls are unordered and start an independent server-side worker per accepted call.
+Use :class:`Pyro5.client.OrderedOnewayChannel` when calls must be submitted asynchronously, but
+executed on the server in the exact submission order of that channel::
+
+    with Pyro5.api.Proxy(uri) as proxy:
+        with Pyro5.api.OrderedOnewayChannel(proxy, queue_size=16,
+                                           on_failure=Pyro5.api.POLICY_CONTINUE,
+                                           on_error=error_receiver_uri) as channel:
+            receipt = channel.configure(value=1)
+            channel.compute(value=2)
+            channel.mark_done()
+
+``submit`` waits only for the admission reply. It returns the assigned sequence, the queue size
+and the number of queued calls. It does not wait for the business method to finish. Submissions
+are rejected immediately with ``OrderedOnewayQueueFullError`` when the waiting queue is full.
+
+Set ``on_failure=Pyro5.api.POLICY_STOP`` to abort calls that were accepted but still queued when
+a preceding call fails. The default ``POLICY_CONTINUE`` runs later calls after reporting the error.
+
+Errors are reported asynchronously by invoking the configured ``error_method`` (default
+``handle_ordered_oneway_error``) on the ``on_error`` Pyro URI. Failure of that receiver is logged
+and does not stop or block the ordered execution channel. Peers that do not advertise the
+capability raise ``OrderedOnewayUnsupportedError`` while creating a channel.

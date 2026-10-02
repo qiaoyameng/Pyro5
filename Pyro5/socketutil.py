@@ -421,6 +421,7 @@ class SocketConnection(object):
     def __init__(self, sock: socket.socket, objectId: str = None, keep_open: bool = False) -> None:
         self.sock = sock
         self.objectId = objectId
+        self.pyro_capabilities = set()
         self.pyroInstances = {}    # type: Dict[Type, Any]   # pyro objects for instance_mode=session
         self.tracked_resources = weakref.WeakSet()   # type: weakref.WeakSet[Any]  # weakrefs to resources for this connection
         self.keep_open = keep_open

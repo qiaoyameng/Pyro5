@@ -56,6 +56,10 @@ FLAGS_BATCH = 1 << 3
 FLAGS_ITEMSTREAMRESULT = 1 << 4
 FLAGS_KEEPSERIALIZED = 1 << 5
 FLAGS_CORR_ID = 1 << 6
+FLAGS_ORDERED_ONEWAY = 1 << 7
+
+CAP_ORDERED_ONEWAY = "ordered-oneway"
+ANNOTATION_ORDERED_ONEWAY = "O1CH"
 
 # wire protocol version. Note that if this gets updated, Pyrolite might need an update too.
 PROTOCOL_VERSION = 502

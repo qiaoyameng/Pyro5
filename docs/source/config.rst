@@ -96,6 +96,12 @@ NATHOST                   str     None                    External hostname in c
 NATPORT                   int     0                       External port in case of NAT (used by the server) 0=replicate internal port number as NAT port
 BROADCAST_ADDRS           str     <broadcast>, 0.0.0.0    List of comma separated addresses that Pyro should send broadcasts to (for NS locating in clients)
 ONEWAY_THREADED           bool    True                    Enable to make oneway calls be processed in their own separate thread
+ORDERED_ONEWAY_QUEUE_SIZE int     16                      Maximum number of accepted ordered oneway calls waiting in each channel, excluding the call currently running
+ORDERED_ONEWAY_WORKERS    int     8                       Size of the fixed daemon worker pool that executes ordered oneway calls
+ORDERED_ONEWAY_ERROR_WORKERS int  2                       Size of the fixed daemon worker pool that invokes ordered oneway error receivers
+ORDERED_ONEWAY_MAX_CHANNELS int  1000                    Maximum number of live ordered oneway channels per daemon
+ORDERED_ONEWAY_ERROR_QUEUE_SIZE int 1000                 Maximum number of asynchronous ordered oneway error reports waiting for delivery
+ORDERED_ONEWAY_ERROR_TIMEOUT float 5.0                   Timeout in seconds when invoking an ordered oneway error receiver
 POLLTIMEOUT               float   2.0                     For the multiplexing server only: the timeout of the select or poll calls
 SERVERTYPE                str     thread                  Select the Pyro server type. thread=thread pool based, multiplex=select/poll/kqueue based
 SOCK_REUSE                bool    True                    Should SO_REUSEADDR be used on sockets that Pyro creates.

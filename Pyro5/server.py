@@ -8,6 +8,7 @@ import os
 import sys
 import uuid
 import time
+import marshal
 import socket
 import collections
 import threading
@@ -18,7 +19,7 @@ import weakref
 import serpent
 import ipaddress
 from typing import TypeVar, Tuple, Union, Optional, Dict, Any, Sequence, Set
-from . import config, core, errors, serializers, socketutil, protocol, client
+from . import config, core, errors, serializers, socketutil, protocol, client, orderedoneway
 from .callcontext import current_context
 from collections.abc import Callable
 
@@ -258,6 +259,7 @@ class Daemon(object):
         self.create_single_instance_lock = threading.Lock()
         self.__mustshutdown.clear()
         self.methodcall_error_handler = _default_methodcall_error_handler
+        self._ordered_oneway_dispatcher = orderedoneway._OrderedOnewayDispatcher(self)
 
     @property
     def sock(self):
@@ -343,10 +345,14 @@ class Daemon(object):
             serializer_id = msg.serializer_id
             serializer = serializers.serializers_by_id[serializer_id]
             data = serializer.loads(msg.data)
+            if not isinstance(data, dict):
+                raise errors.ProtocolError("invalid handshake payload")
+            conn.pyro_capabilities = set(data.get("features", ()))
             handshake_response = self.validateHandshake(conn, data["handshake"])
             handshake_response = {
                 "handshake": handshake_response,
-                "meta": self.objectsById[core.DAEMON_NAME].get_metadata(data["object"])
+                "meta": self.objectsById[core.DAEMON_NAME].get_metadata(data["object"]),
+                "features": [protocol.CAP_ORDERED_ONEWAY],
             }
             data = serializer.dumps(handshake_response)
             msgtype = protocol.MSG_CONNECTOK
@@ -392,6 +398,7 @@ class Daemon(object):
         request_serializer_id = serializers.MarshalSerializer.serializer_id
         wasBatched = False
         isCallback = False
+        is_ordered = False
         try:
             msg = protocol.recv_stub(conn, [protocol.MSG_INVOKE, protocol.MSG_PING])
         except errors.CommunicationError as x:
@@ -433,6 +440,29 @@ class Daemon(object):
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
             del msg  # invite GC to collect the object, don't wait for out-of-scope
+            is_ordered = bool(request_flags & protocol.FLAGS_ORDERED_ONEWAY)
+            ordered_options = None
+            if is_ordered:
+                if request_flags & protocol.FLAGS_ONEWAY:
+                    raise errors.ProtocolError("ordered oneway calls cannot use the normal oneway flag")
+                if request_flags & protocol.FLAGS_BATCH:
+                    raise errors.ProtocolError("ordered oneway calls cannot be batched")
+                if protocol.CAP_ORDERED_ONEWAY not in getattr(conn, "pyro_capabilities", set()):
+                    raise errors.OrderedOnewayUnsupportedError(
+                        "client did not negotiate ordered oneway support")
+                annotation = current_context.annotations.get(protocol.ANNOTATION_ORDERED_ONEWAY)
+                if not annotation:
+                    raise errors.ProtocolError("missing ordered oneway channel annotation")
+                ordered_options = marshal.loads(bytes(annotation))
+                if ordered_options.get("policy") not in orderedoneway._POLICIES:
+                    raise errors.ProtocolError("invalid ordered oneway policy")
+                error_method = ordered_options.get("error_method")
+                if error_method is not None and (
+                        not isinstance(error_method, str) or not error_method or is_private_attribute(error_method)):
+                    raise errors.ProtocolError("invalid ordered oneway error receiver method")
+                error_uri = ordered_options.get("error_uri")
+                if error_uri is not None and not isinstance(error_uri, (str, Callable)):
+                    raise errors.ProtocolError("invalid ordered oneway error receiver")
             obj = _unpack_weakref(self.objectsById.get(objId))
             if obj is not None:
                 if inspect.isclass(obj):
@@ -454,7 +484,9 @@ class Daemon(object):
                     wasBatched = True
                 else:
                     # normal single method call
-                    if method == "__getattr__":
+                    if is_ordered and method in ("__getattr__", "__setattr__"):
+                        raise errors.ProtocolError("ordered oneway calls do not support remote attribute access")
+                    elif method == "__getattr__":
                         # special case for direct attribute access (only exposed @properties are accessible)
                         data = _get_exposed_property_value(obj, vargs[0])
                         if not request_flags & protocol.FLAGS_ONEWAY:
@@ -472,7 +504,13 @@ class Daemon(object):
                         data = _set_exposed_property_value(obj, vargs[0], vargs[1])
                     else:
                         method = _get_attribute(obj, method)
-                        if request_flags & protocol.FLAGS_ONEWAY:
+                        if is_ordered:
+                            call_context = current_context.to_global()
+                            call_context["client"] = None
+                            self._ordered_oneway_dispatcher.start()
+                            data = self._ordered_oneway_dispatcher.submit(
+                                conn, objId, method, vargs, kwargs, ordered_options, call_context)
+                        elif request_flags & protocol.FLAGS_ONEWAY:
                             # oneway call to be run inside its own thread, otherwise client blocking can still occur
                             #    on the next call on the same proxy
                             _OnewayCallThread(method, vargs, kwargs, self, current_context.client_sock_addr).start()
@@ -503,6 +541,8 @@ class Daemon(object):
                 response_flags = 0
                 if wasBatched:
                     response_flags |= protocol.FLAGS_BATCH
+                if is_ordered:
+                    response_flags |= protocol.FLAGS_ORDERED_ONEWAY
                 msg = protocol.SendingMessage(protocol.MSG_RESULT, response_flags, request_seq, serializer.serializer_id, data,
                                               annotations=self.__annotations())
                 current_context.response_annotations = {}
@@ -539,6 +579,8 @@ class Daemon(object):
                     info = self.streaming_responses.get(streamId, None)
                     if info and info[0] is conn:
                         del self.streaming_responses[streamId]
+        if self.transportServer:
+            self._ordered_oneway_dispatcher.disconnect_connection(conn)
         self.clientDisconnect(conn)  # user overridable hook
 
     def _housekeeping(self):
@@ -757,6 +799,9 @@ class Daemon(object):
         """Close down the server and release resources"""
         self.__mustshutdown.set()
         self.streaming_responses = {}
+        dispatcher = getattr(self, "_ordered_oneway_dispatcher", None)
+        if dispatcher:
+            dispatcher.close()
         if self.transportServer:
             log.debug("daemon closing")
             self.transportServer.close()

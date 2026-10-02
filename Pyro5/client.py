@@ -7,6 +7,9 @@ Pyro - Python Remote Objects.  Copyright by Irmen de Jong (irmen@razorvine.net).
 import sys
 import time
 import logging
+import marshal
+import threading
+import uuid
 import serpent
 import contextlib
 from . import config, core, serializers, protocol, errors, socketutil
@@ -19,7 +22,8 @@ except ImportError:
 
 log = logging.getLogger("Pyro5.client")
 
-__all__ = ["Proxy", "BatchProxy", "SerializedBlob"]
+__all__ = ["Proxy", "BatchProxy", "SerializedBlob", "OrderedOnewayChannel",
+           "POLICY_CONTINUE", "POLICY_STOP"]
 
 
 class Proxy(object):
@@ -70,6 +74,7 @@ class Proxy(object):
         self._pyroMethods = set()  # all methods of the remote object, gotten from meta-data
         self._pyroAttrs = set()  # attributes of the remote object, gotten from meta-data
         self._pyroOneway = set()  # oneway-methods of the remote object, gotten from meta-data
+        object.__setattr__(self, "_pyroCapabilities", set())
         self._pyroSeq = 0  # message sequence number
         self._pyroRawWireResponse = False  # internal switch to enable wire level responses
         self._pyroHandshake = "hello"  # the data object that should be sent in the initial connection handshake message
@@ -139,6 +144,7 @@ class Proxy(object):
         self._pyroSerializer = state[5]
         self.__pyroTimeout = config.COMMTIMEOUT
         self._pyroMaxRetries = config.MAX_RETRIES
+        object.__setattr__(self, "_pyroCapabilities", set())
         self._pyroConnection = None
         self._pyroLocalSocket = None
         self._pyroSeq = 0
@@ -226,7 +232,7 @@ class Proxy(object):
         If the timeout expires before the remote method call returns,
         Pyro will raise a :exc:`Pyro5.errors.TimeoutError`""")
 
-    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None):
+    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None, invoke_annotations=None):
         """perform the remote method call communication"""
         self.__check_owner()
         current_context.response_annotations = {}
@@ -234,14 +240,14 @@ class Proxy(object):
             self.__pyroCreateConnection()
         serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
         objectId = objectId or self._pyroConnection.objectId
-        annotations = current_context.annotations
+        annotations = invoke_annotations if invoke_annotations is not None else current_context.annotations
         if vargs and isinstance(vargs[0], SerializedBlob):
             # special serialization of a 'blob' that stays serialized
             data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId, methodname, serializer)
         else:
             # normal serialization of the remote call
             data = serializer.dumpsCall(objectId, methodname, vargs, kwargs)
-        if methodname in self._pyroOneway:
+        if methodname in self._pyroOneway and not flags & protocol.FLAGS_ORDERED_ONEWAY:
             flags |= protocol.FLAGS_ONEWAY
         self._pyroSeq = (self._pyroSeq + 1) & 0xffff
         msg = protocol.SendingMessage(protocol.MSG_INVOKE, flags, self._pyroSeq, serializer.serializer_id, data, annotations=annotations)
@@ -323,7 +329,8 @@ class Proxy(object):
                     raise
                 # Do handshake.
                 serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
-                data = {"handshake": self._pyroHandshake, "object": uri.object}
+                data = {"handshake": self._pyroHandshake, "object": uri.object,
+                        "features": [protocol.CAP_ORDERED_ONEWAY]}
                 data = serializer.dumps(data)
                 msg = protocol.SendingMessage(protocol.MSG_CONNECT, 0, self._pyroSeq, serializer.serializer_id,
                                               data, annotations=current_context.annotations)
@@ -354,6 +361,8 @@ class Proxy(object):
                     raise errors.CommunicationError(error)
                 elif msg.type == protocol.MSG_CONNECTOK:
                     self.__processMetadata(handshake_response["meta"])
+                    object.__setattr__(self, "_pyroCapabilities",
+                                       set(handshake_response.get("features", ())))
                     handshake_response = handshake_response["handshake"]
                     self._pyroConnection = conn
                     self._pyroLocalSocket = conn.sock.getsockname()
@@ -498,6 +507,91 @@ class Proxy(object):
         if get_ident() != self.__pyroOwnerThread:
             raise errors.PyroError("the calling thread is not the owner of this proxy, "
                                    "create a new proxy in this thread or transfer ownership.")
+
+
+POLICY_CONTINUE = "continue"
+POLICY_STOP = "stop"
+
+
+class OrderedOnewayChannel(object):
+    """
+    Bounded channel that submits ordered oneway calls and only waits for server acceptance.
+    """
+
+    def __init__(self, proxy, queue_size=None, on_error=None, error_method=None,
+                 on_failure=POLICY_CONTINUE):
+        self.proxy = proxy
+        self.maxsize = config.ORDERED_ONEWAY_QUEUE_SIZE if queue_size is None else queue_size
+        if not isinstance(self.maxsize, int) or isinstance(self.maxsize, bool) or self.maxsize <= 0:
+            raise ValueError("queue_size must be a positive integer")
+        self.policy = on_failure
+        if self.policy not in (POLICY_CONTINUE, POLICY_STOP):
+            raise ValueError("on_failure must be %r or %r" % (POLICY_CONTINUE, POLICY_STOP))
+        if error_method is not None and not isinstance(error_method, str):
+            raise TypeError("error_method must be a string or None")
+        self.error_uri = self._error_uri(on_error)
+        self.error_method = error_method if error_method is not None else "handle_ordered_oneway_error"
+        if not self.error_method or self.error_method.startswith("_"):
+            raise ValueError("error_method must be a public exposed method")
+        self.id = uuid.uuid4().hex
+        self.sequence = 0
+        self.closed = False
+        self.lock = threading.Lock()
+        proxy._pyroBind()
+        if protocol.CAP_ORDERED_ONEWAY not in proxy._pyroCapabilities:
+            raise errors.OrderedOnewayUnsupportedError("remote daemon does not support ordered oneway channels")
+
+    @staticmethod
+    def _error_uri(on_error):
+        if on_error is None:
+            return None
+        if isinstance(on_error, core.URI):
+            return str(on_error)
+        if isinstance(on_error, Proxy):
+            return str(on_error._pyroUri)
+        if isinstance(on_error, str):
+            return on_error
+        raise TypeError("on_error must be a Pyro URI, Proxy, URI string, or None")
+
+    def submit(self, method, *vargs, **kwargs):
+        if self.closed:
+            raise errors.OrderedOnewayChannelClosedError("ordered oneway channel is closed")
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty method name")
+        options = {
+            "id": self.id,
+            "sequence": self.sequence + 1,
+            "maxsize": self.maxsize,
+            "policy": self.policy,
+            "error_uri": self.error_uri,
+            "error_method": self.error_method,
+        }
+        annotations = {protocol.ANNOTATION_ORDERED_ONEWAY: marshal.dumps(options)}
+        with self.lock:
+            try:
+                receipt = self.proxy._pyroInvoke(
+                    method, vargs, kwargs, flags=protocol.FLAGS_ORDERED_ONEWAY,
+                    invoke_annotations=annotations)
+            except (errors.CommunicationError, errors.OrderedOnewayChannelClosedError):
+                self.closed = True
+                raise
+            self.sequence += 1
+            self.maxsize = receipt["maxsize"]
+            return receipt
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda *vargs, **kwargs: self.submit(name, *vargs, **kwargs)
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 class _RemoteMethod(object):
