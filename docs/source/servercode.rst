@@ -115,6 +115,54 @@ See :ref:`oneway-calls-client` for the documentation about how client code handl
 See the `oneway example <https://github.com/irmen/Pyro5/tree/master/examples/oneway>`_ for some code that demonstrates the use of oneway methods.
 
 
+.. index:: dedup decorator, call deduplication
+
+.. _call-deduplication:
+
+**Allowing safe retries with the @Pyro5.server.dedup decorator:**
+
+When a client's connection breaks after it sent a call, it cannot know whether the server
+already executed the method or not. Retrying the call could execute it a second time,
+which is a problem for methods with side effects. Pyro offers an *opt-in* call deduplication
+protocol for this: mark the methods that support it with the ``@Pyro5.server.dedup`` decorator::
+
+    import Pyro5.server
+
+    @Pyro5.server.expose
+    class PyroService(object):
+
+        @Pyro5.server.dedup
+        def transfer(self, amount, destination):
+            ...
+
+Clients can then attach a unique *call key* to the call (see :ref:`call-dedup-client`).
+The daemon executes the method at most once per call key and records the outcome.
+A retry carrying the same key is answered by replaying the recorded response
+(a recorded exception is replayed as well) instead of executing the method again.
+
+The details of the protocol:
+
+- The deduplication identity consists of the object id, the method name, the *trusted caller scope*
+  and the call key. The caller scope is derived by the server itself (by default the client's
+  network address, which survives reconnects); clients cannot claim another caller's scope
+  to replay their results. Override :py:meth:`Pyro5.server.Daemon.dedup_caller_scope` to use a
+  different notion of caller identity, for instance an authenticated principal.
+- A retry with the same key but *different arguments* is rejected with
+  :py:exc:`Pyro5.errors.CallDedupError` and is not executed.
+- If a duplicate arrives while the original call is still executing, the daemon by default
+  waits for it to complete and then replays its response. Set ``DEDUP_WAIT`` to False to
+  instead immediately raise :py:exc:`Pyro5.errors.CallInProgressError` on the client
+  (``DEDUP_WAIT_TIMEOUT`` bounds the waiting time).
+- The number of recorded call outcomes is bounded (``DEDUP_MAX_RECORDS``, least recently
+  used records are evicted) and every record has a limited lifetime
+  (``DEDUP_RECORD_LIFETIME`` seconds).
+- Records are kept in memory only and are **not** preserved across a daemon restart.
+  The at-most-once guarantee therefore only holds while a call's record is still valid.
+
+Deduplication is only available for regular method calls (not for oneway or batched calls),
+and streamed (iterator) results cannot be replayed, so they're never recorded.
+
+
 Exposing classes and methods without changing existing source code
 ==================================================================
 
@@ -821,4 +869,3 @@ This function's signature is::
     def custom_error_handler(daemon: Daemon, client_sock: socketutil.SocketConnection,
                              method: Callable, vargs: Sequence[Any], kwargs: Dict[str, Any],
                              exception: Exception) -> None
-

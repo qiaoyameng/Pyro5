@@ -2,6 +2,16 @@
 Change Log
 **********
 
+**Pyro 5.18 (unreleased)**
+
+- Added an opt-in call deduplication protocol: methods marked with the new ``@Pyro5.server.dedup``
+  decorator can be called with a client-supplied call key (``Pyro5.client.call_key``) and safely
+  retried with that same key when the response got lost; the daemon executes the call at most once
+  per key and replays the recorded result or failure. Records are bounded in count and lifetime
+  (new ``DEDUP_MAX_RECORDS``, ``DEDUP_RECORD_LIFETIME``, ``DEDUP_WAIT`` and ``DEDUP_WAIT_TIMEOUT``
+  config items) and are not preserved across daemon restarts.
+- Added ``CallDedupError`` and ``CallInProgressError`` exceptions.
+
 **Pyro 5.17**
 
 - Fixed slow ``locate_ns()`` on Windows: skipped reverse DNS lookup of 127.0.1.1 which caused 5+ second delays due to DNS timeout.

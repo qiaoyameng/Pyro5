@@ -58,6 +58,16 @@ class SecurityError(PyroError):
     pass
 
 
+class CallDedupError(PyroError):
+    """A call deduplication key conflict or another call deduplication protocol violation occurred."""
+    pass
+
+
+class CallInProgressError(PyroError):
+    """A call carrying the same deduplication key is still being processed by the server."""
+    pass
+
+
 class SerializeError(ProtocolError):
     """Something went wrong while (de)serializing data."""
     pass

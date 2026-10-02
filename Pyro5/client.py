@@ -19,7 +19,36 @@ except ImportError:
 
 log = logging.getLogger("Pyro5.client")
 
-__all__ = ["Proxy", "BatchProxy", "SerializedBlob"]
+__all__ = ["Proxy", "BatchProxy", "SerializedBlob", "call_key"]
+
+
+@contextlib.contextmanager
+def call_key(key):
+    """
+    Context manager that attaches a call deduplication key to the remote calls
+    made inside its body. This only has an effect on methods that the server
+    explicitly marked as supporting call deduplication (via the
+    :func:`Pyro5.server.dedup` decorator); for all other methods the key is ignored.
+    If the response of such a call gets lost (connection dropped, timeout),
+    you can retry the call with the same key and the same arguments, and the
+    server will replay the recorded outcome instead of executing the method again.
+    The guarantee only holds while the server still has the call's record
+    (records are bounded in count and lifetime, and don't survive a daemon restart).
+    """
+    if not isinstance(key, str) or not key:
+        raise ValueError("call key must be a non-empty string")
+    encoded = key.encode("utf-8")
+    if len(encoded) > 255:
+        raise ValueError("call key is too long (max 255 utf-8 bytes)")
+    previous = current_context.annotations.get("DKEY")
+    current_context.annotations["DKEY"] = encoded
+    try:
+        yield
+    finally:
+        if previous is None:
+            current_context.annotations.pop("DKEY", None)
+        else:
+            current_context.annotations["DKEY"] = previous
 
 
 class Proxy(object):

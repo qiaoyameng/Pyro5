@@ -8,6 +8,7 @@ import os
 import sys
 import uuid
 import time
+import hashlib
 import socket
 import collections
 import threading
@@ -22,7 +23,13 @@ from . import config, core, errors, serializers, socketutil, protocol, client
 from .callcontext import current_context
 from collections.abc import Callable
 
-__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "serve"]
+__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "dedup", "serve"]
+
+#: wire annotation id used to carry the call deduplication key from client to server
+DEDUP_KEY_ANNOTATION = "DKEY"
+
+#: maximum length (in utf-8 bytes) of a call deduplication key
+DEDUP_KEY_MAX_LENGTH = 255
 
 log = logging.getLogger("Pyro5.server")
 
@@ -69,6 +76,23 @@ def oneway(method: Callable) -> Callable:
     method._pyroOneway = True       # type: ignore
     return method
 
+
+def dedup(method: Callable) -> Callable:
+    """
+    decorator to mark a method as supporting call deduplication.
+    Clients may then attach a call key to the remote call (see :func:`Pyro5.client.call_key`)
+    and safely retry the call with the same key if the response got lost:
+    the daemon will execute the method at most once per key and replays the recorded
+    result (or recorded failure) to subsequent retries carrying the same key.
+    The deduplication identity consists of the object id, the method name and the
+    trusted caller scope (see :meth:`Daemon.dedup_caller_scope`).
+    Records are kept in memory only, are bounded in count and lifetime
+    (see the ``DEDUP_MAX_RECORDS`` and ``DEDUP_RECORD_LIFETIME`` config items),
+    and don't survive a daemon restart: the at-most-once guarantee only holds
+    while the record is still valid.
+    """
+    method._pyroDedup = True        # type: ignore
+    return method
 
 _T = TypeVar("_T", bound=Union[Callable, type])
 
@@ -253,6 +277,8 @@ class Daemon(object):
         log.debug("pyro protocol version: %d", protocol.PROTOCOL_VERSION)
         self._pyroInstances = {}   # pyro objects for instance_mode=single (singletons, just one per daemon)
         self.streaming_responses = {}   # stream_id -> (client, creation_timestamp, linger_timestamp, stream)
+        self._dedup_records = collections.OrderedDict()  # call dedup identity -> _DedupRecord (LRU ordered)
+        self._dedup_lock = threading.Lock()
         self.housekeeper_lock = threading.Lock()
         self._disconnect_lock = threading.Lock()
         self.create_single_instance_lock = threading.Lock()
@@ -392,6 +418,7 @@ class Daemon(object):
         request_serializer_id = serializers.MarshalSerializer.serializer_id
         wasBatched = False
         isCallback = False
+        dedup_record = None
         try:
             msg = protocol.recv_stub(conn, [protocol.MSG_INVOKE, protocol.MSG_PING])
         except errors.CommunicationError as x:
@@ -432,6 +459,7 @@ class Daemon(object):
             current_context.annotations = msg.annotations
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
+            request_payload = msg.data  # keep the raw call bytes for a possible call dedup args fingerprint
             del msg  # invite GC to collect the object, don't wait for out-of-scope
             obj = _unpack_weakref(self.objectsById.get(objId))
             if obj is not None:
@@ -471,6 +499,7 @@ class Daemon(object):
                         # special case for direct attribute access (only exposed @properties are accessible)
                         data = _set_exposed_property_value(obj, vargs[0], vargs[1])
                     else:
+                        method_name = method
                         method = _get_attribute(obj, method)
                         if request_flags & protocol.FLAGS_ONEWAY:
                             # oneway call to be run inside its own thread, otherwise client blocking can still occur
@@ -478,6 +507,23 @@ class Daemon(object):
                             _OnewayCallThread(method, vargs, kwargs, self, current_context.client_sock_addr).start()
                         else:
                             isCallback = getattr(method, "_pyroCallback", False)
+                            dedup_key = None
+                            if getattr(method, "_pyroDedup", False):
+                                dedup_key = current_context.annotations.get(DEDUP_KEY_ANNOTATION)
+                            if dedup_key is not None:
+                                dedup_outcome = self._dedup_begin(objId, method_name, dedup_key,
+                                                                  request_payload, request_serializer_id)
+                                if not isinstance(dedup_outcome, _DedupRecord):
+                                    # replay the recorded response of the earlier call with the same key
+                                    replay_payload, replay_flags = dedup_outcome
+                                    msg = protocol.SendingMessage(protocol.MSG_RESULT, replay_flags, request_seq,
+                                                                  request_serializer_id, replay_payload,
+                                                                  annotations=self.__annotations())
+                                    if config.LOGWIRE:
+                                        protocol.log_wiredata(log, "daemon wiredata sending (dedup replay)", msg)
+                                    conn.send(msg.data)
+                                    return
+                                dedup_record = dedup_outcome
                             try:
                                 data = method(*vargs, **kwargs)  # this is the actual method call to the Pyro object
                             except Exception as xv:
@@ -486,6 +532,10 @@ class Daemon(object):
                             if not request_flags & protocol.FLAGS_ONEWAY:
                                 isStream, data = self._streamResponse(data, conn)
                                 if isStream:
+                                    if dedup_record is not None:
+                                        # streamed results cannot be replayed, don't keep a record
+                                        self._dedup_abandon(dedup_record)
+                                        dedup_record = None
                                     # throw an exception as well as setting message flags
                                     # this way, it is backwards compatible with older pyro versions.
                                     exc = errors.ProtocolError("result of call is an iterator")
@@ -508,19 +558,33 @@ class Daemon(object):
                 current_context.response_annotations = {}
                 if config.LOGWIRE:
                     protocol.log_wiredata(log, "daemon wiredata sending", msg)
+                if dedup_record is not None:
+                    # record the response so that a retry carrying the same call key can be answered by replaying it
+                    self._dedup_finish(dedup_record, data, response_flags)
+                    dedup_record = None
                 conn.send(msg.data)
         except Exception as xv:
             msg = getattr(xv, "pyroMsg", None)
             if msg:
                 request_seq = msg.seq
                 request_serializer_id = msg.serializer_id
-            if not isinstance(xv, errors.ConnectionClosedError):
-                if not request_flags & protocol.FLAGS_ONEWAY:
-                    if isinstance(xv, errors.SerializeError) or not isinstance(xv, errors.CommunicationError):
-                        # only return the error to the client if it wasn't a oneway call, and not a communication error
-                        # (in these cases, it makes no sense to try to report the error back to the client...)
-                        tblines = errors.format_traceback(detailed=config.DETAILED_TRACEBACK)
-                        self._sendExceptionResponse(conn, request_seq, request_serializer_id, xv, tblines)
+            try:
+                if not isinstance(xv, errors.ConnectionClosedError):
+                    if not request_flags & protocol.FLAGS_ONEWAY:
+                        if isinstance(xv, errors.SerializeError) or not isinstance(xv, errors.CommunicationError):
+                            # only return the error to the client if it wasn't a oneway call, and not a communication error
+                            # (in these cases, it makes no sense to try to report the error back to the client...)
+                            tblines = errors.format_traceback(detailed=config.DETAILED_TRACEBACK)
+                            error_payload = self._sendExceptionResponse(conn, request_seq, request_serializer_id, xv, tblines)
+                            if dedup_record is not None:
+                                # record the failure as well: a retry with the same call key replays the same error
+                                self._dedup_finish(dedup_record, error_payload, protocol.FLAGS_EXCEPTION)
+                                dedup_record = None
+            finally:
+                if dedup_record is not None:
+                    # the call outcome could not be recorded (or reported), drop the record
+                    # so that a later retry with the same key simply re-executes the call
+                    self._dedup_abandon(dedup_record)
             if isCallback or isinstance(xv, (errors.CommunicationError, errors.SecurityError)):
                 raise  # re-raise if flagged as callback, communication or security error.
 
@@ -548,6 +612,9 @@ class Daemon(object):
         if self._shutting_down:
             return
         with self.housekeeper_lock:
+            if self._dedup_records and config.DEDUP_RECORD_LIFETIME > 0:
+                with self._dedup_lock:
+                    self._dedup_evict(time.time())
             if self.streaming_responses:
                 if config.ITER_STREAM_LIFETIME > 0:
                     # cleanup iter streams that are past their lifetime
@@ -573,6 +640,114 @@ class Daemon(object):
         This will be called every few seconds by the running daemon's request loop.
         """
         pass
+
+    def dedup_caller_scope(self, conn):
+        """
+        Returns the trusted caller scope that is part of the call deduplication identity
+        (next to the object id, the method name and the client supplied call key).
+        The scope is derived by the server itself, clients cannot claim another scope
+        to replay (or poison) someone else's recorded call results.
+        The default implementation uses the client's network address (host),
+        which survives reconnects from the same client machine.
+        Override this to integrate a different notion of caller identity,
+        for instance an authenticated principal established in :meth:`validateHandshake`.
+        """
+        try:
+            peer = conn.sock.getpeername() if conn is not None else None
+        except (socket.error, AttributeError):
+            peer = None
+        if isinstance(peer, tuple):
+            return peer[0]
+        return str(peer) if peer else "<local>"
+
+    def _dedup_begin(self, objectId, method_name, dedup_key, request_payload, serializer_id):
+        """
+        Register or look up a call deduplication record for the given call.
+        Returns a _DedupRecord if this call must be executed (the record has to be
+        completed afterwards via _dedup_finish or _dedup_abandon), or a
+        (payload, flags) tuple with the recorded response that should be replayed.
+        Raises CallDedupError or CallInProgressError on protocol violations.
+        """
+        try:
+            key = bytes(dedup_key).decode("utf-8")
+        except (TypeError, UnicodeDecodeError):
+            raise errors.CallDedupError("invalid call dedup key annotation (must be utf-8 text)") from None
+        if not key or len(key.encode("utf-8")) > DEDUP_KEY_MAX_LENGTH:
+            raise errors.CallDedupError("invalid call dedup key (must be 1..%d utf-8 bytes)" % DEDUP_KEY_MAX_LENGTH)
+        caller = self.dedup_caller_scope(current_context.client)
+        identity = (objectId, method_name, caller, key)
+        # The args fingerprint is only ever compared *within* a single dedup identity
+        # (object+method+caller+key). Serialized bytes equality across identities is
+        # not used to authorize anything.
+        fingerprint = hashlib.sha256(serializer_id.to_bytes(2, "big"))
+        fingerprint.update(request_payload)
+        fingerprint = fingerprint.digest()
+        now = time.time()
+        with self._dedup_lock:
+            record = self._dedup_records.get(identity)
+            if record is not None and record.state != "busy" and self._dedup_expired(record, now):
+                # the earlier record is no longer valid, the call is executed again
+                del self._dedup_records[identity]
+                record = None
+            if record is None:
+                if config.DEDUP_MAX_RECORDS < 1:
+                    raise errors.CallDedupError("call deduplication is disabled (DEDUP_MAX_RECORDS < 1)")
+                self._dedup_evict(now)
+                record = _DedupRecord(identity, fingerprint)
+                self._dedup_records[identity] = record
+                return record
+            self._dedup_records.move_to_end(identity)
+            if record.fingerprint != fingerprint:
+                raise errors.CallDedupError(
+                    "call dedup key %r was already used for a call with different arguments" % key)
+            if record.state == "done" or (record.state == "failed" and record.result_payload is not None):
+                return record.result_payload, record.result_flags
+            if record.state != "busy":
+                raise errors.CallDedupError("call dedup record for key %r is unusable" % key)
+        # another call with the same key is currently being executed
+        if not config.DEDUP_WAIT:
+            raise errors.CallInProgressError("a call with dedup key %r is still in progress" % key)
+        if not record.completed.wait(config.DEDUP_WAIT_TIMEOUT):
+            raise errors.CallInProgressError("a call with dedup key %r is still in progress" % key)
+        if record.state == "done" or (record.state == "failed" and record.result_payload is not None):
+            return record.result_payload, record.result_flags
+        raise errors.CallDedupError(
+            "call dedup record for key %r vanished, the earlier call's outcome is unknown" % key)
+
+    def _dedup_finish(self, record, response_payload, response_flags):
+        """store the response of a dedup'd call so that retries with the same key can replay it"""
+        with self._dedup_lock:
+            record.state = "failed" if response_flags & protocol.FLAGS_EXCEPTION else "done"
+            record.result_payload = response_payload
+            record.result_flags = response_flags
+            record.timestamp = time.time()
+            record.completed.set()
+
+    def _dedup_abandon(self, record):
+        """drop a dedup record whose outcome could not be recorded; a retry will re-execute the call"""
+        with self._dedup_lock:
+            self._dedup_records.pop(record.identity, None)
+            record.state = "failed"
+            record.completed.set()
+
+    def _dedup_evict(self, now):
+        """expire old dedup records and enforce the maximum record count. Caller must hold the dedup lock."""
+        expired = [identity for identity, record in self._dedup_records.items()
+                   if record.state != "busy" and self._dedup_expired(record, now)]
+        for identity in expired:
+            del self._dedup_records[identity]
+        while len(self._dedup_records) >= max(1, config.DEDUP_MAX_RECORDS):
+            for identity, record in self._dedup_records.items():
+                if record.state != "busy":
+                    del self._dedup_records[identity]
+                    break
+            else:
+                break  # all records are still busy, can't evict any
+
+    @staticmethod
+    def _dedup_expired(record, now):
+        """checks if a completed dedup record is past its lifetime"""
+        return 0 < config.DEDUP_RECORD_LIFETIME < now - record.timestamp
 
     def _getInstance(self, clazz, conn):
         """
@@ -617,7 +792,7 @@ class Daemon(object):
             raise errors.DaemonError("invalid instancemode in registered class")
 
     def _sendExceptionResponse(self, connection, seq, serializer_id, exc_value, tbinfo, flags=0, annotations=None):
-        """send an exception back including the local traceback info"""
+        """send an exception back including the local traceback info, returns the serialized response payload"""
         exc_value._pyroTraceback = tbinfo
         serializer = serializers.serializers_by_id[serializer_id]
         try:
@@ -636,6 +811,7 @@ class Daemon(object):
         if config.LOGWIRE:
             protocol.log_wiredata(log, "daemon wiredata sending (error response)", msg)
         connection.send(msg.data)
+        return data
 
     def register(self, obj_or_class, objectId=None, force=False, weak=False):
         """
@@ -997,6 +1173,23 @@ def _set_exposed_property_value(obj: Any, propname: str, value: Any, only_expose
         if v.fset and getattr(pfunc, "_pyroExposed", not only_exposed):
             return v.fset(obj, value)
     raise AttributeError("attempt to access unexposed or unknown remote attribute '%s'" % propname)
+
+
+class _DedupRecord:
+    """
+    Bookkeeping for a single call deduplication identity.
+    Records live in memory only and are not preserved across a daemon restart:
+    the at-most-once execution guarantee only holds while the record is still valid
+    (see the DEDUP_MAX_RECORDS and DEDUP_RECORD_LIFETIME config items).
+    """
+    def __init__(self, identity, args_fingerprint):
+        self.identity = identity
+        self.fingerprint = args_fingerprint
+        self.state = "busy"          # busy -> done | failed
+        self.result_payload = None   # serialized response, replayed to retries with the same key
+        self.result_flags = 0
+        self.timestamp = time.time()
+        self.completed = threading.Event()
 
 
 class _OnewayCallThread(threading.Thread):

@@ -465,6 +465,37 @@ You can also do this on a pre-proxy basis by setting the max retries property on
 Be careful to use when remote functions have a side effect (e.g.: calling twice results in error)!
 See the `autoretry example <https://github.com/irmen/Pyro5/tree/master/examples/autoretry>`_ for more details.
 
+.. index:: call key, call deduplication
+
+.. _call-dedup-client:
+
+Retrying calls safely with a call key
+-------------------------------------
+If the connection breaks after your client sent a call, you cannot know whether the server
+still executed the method. Blindly retrying may execute it twice. For methods that the server
+marked with the ``@Pyro5.server.dedup`` decorator (see :ref:`call-deduplication`) you can
+attach a unique *call key* to the call and safely retry it with the same key::
+
+    import Pyro5.api
+
+    with Pyro5.api.call_key("invoice-12345-pay"):
+        try:
+            service.transfer(100, "account-42")
+        except Pyro5.errors.CommunicationError:
+            pass    # response got lost, server may still have executed the call
+    # ... later, possibly after reconnecting:
+    with Pyro5.api.call_key("invoice-12345-pay"):
+        result = service.transfer(100, "account-42")   # replays the recorded outcome
+
+The server executes the method at most once per call key; a retry with the same key and the
+same arguments replays the recorded result (or the recorded exception). Reusing a key with
+*different* arguments is rejected with :py:exc:`Pyro5.errors.CallDedupError`, and if the
+original call is still executing you either wait for its outcome or get
+:py:exc:`Pyro5.errors.CallInProgressError`, depending on the server's configuration.
+The guarantee only holds while the server still has the call's record: records are bounded
+in count and lifetime, and are lost when the daemon restarts.
+For methods that are not marked with ``@Pyro5.server.dedup`` the key is simply ignored.
+
 .. index::
     double: reconnecting; automatic
 
