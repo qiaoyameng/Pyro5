@@ -53,6 +53,16 @@ class DaemonError(PyroError):
     pass
 
 
+class OrderedOnewayQueueFullError(DaemonError):
+    """The ordered oneway channel queue is full and could not accept the call."""
+    pass
+
+
+class UnsupportedFeatureError(ProtocolError):
+    """The peer does not support a requested optional protocol feature."""
+    pass
+
+
 class SecurityError(PyroError):
     """A security related error occurred."""
     pass

@@ -7,6 +7,8 @@ Pyro - Python Remote Objects.  Copyright by Irmen de Jong (irmen@razorvine.net).
 import sys
 import time
 import logging
+import marshal
+import threading
 import serpent
 import contextlib
 from . import config, core, serializers, protocol, errors, socketutil
@@ -19,7 +21,7 @@ except ImportError:
 
 log = logging.getLogger("Pyro5.client")
 
-__all__ = ["Proxy", "BatchProxy", "SerializedBlob"]
+__all__ = ["Proxy", "BatchProxy", "SerializedBlob", "OrderedOnewayChannel"]
 
 
 class Proxy(object):
@@ -55,6 +57,7 @@ class Proxy(object):
         ["__getnewargs__", "__getnewargs_ex__", "__getinitargs__", "_pyroConnection", "_pyroUri",
          "_pyroOneway", "_pyroMethods", "_pyroAttrs", "_pyroTimeout", "_pyroSeq", "_pyroLocalSocket",
          "_pyroRawWireResponse", "_pyroHandshake", "_pyroMaxRetries", "_pyroSerializer",
+         "_pyroServerFeatures",
          "_Proxy__pyroTimeout", "_Proxy__pyroOwnerThread"])
 
     def __init__(self, uri, connected_socket=None):
@@ -70,6 +73,7 @@ class Proxy(object):
         self._pyroMethods = set()  # all methods of the remote object, gotten from meta-data
         self._pyroAttrs = set()  # attributes of the remote object, gotten from meta-data
         self._pyroOneway = set()  # oneway-methods of the remote object, gotten from meta-data
+        self._pyroServerFeatures = {}
         self._pyroSeq = 0  # message sequence number
         self._pyroRawWireResponse = False  # internal switch to enable wire level responses
         self._pyroHandshake = "hello"  # the data object that should be sent in the initial connection handshake message
@@ -143,6 +147,7 @@ class Proxy(object):
         self._pyroLocalSocket = None
         self._pyroSeq = 0
         self._pyroRawWireResponse = False
+        self._pyroServerFeatures = {}
         self.__pyroOwnerThread = get_ident()
 
     def __copy__(self):
@@ -226,7 +231,7 @@ class Proxy(object):
         If the timeout expires before the remote method call returns,
         Pyro will raise a :exc:`Pyro5.errors.TimeoutError`""")
 
-    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None):
+    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None, ordered_options=None):
         """perform the remote method call communication"""
         self.__check_owner()
         current_context.response_annotations = {}
@@ -235,13 +240,28 @@ class Proxy(object):
         serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
         objectId = objectId or self._pyroConnection.objectId
         annotations = current_context.annotations
+        if ordered_options is not None:
+            flags |= protocol.FLAGS_ORDERED_ONEWAY
+            annotations = dict(annotations)
+            error_receiver = ordered_options.get("error_receiver")
+            if error_receiver is None:
+                receiver_data = b""
+            else:
+                receiver_data = serializer.dumps(error_receiver)
+            annotations["O1WY"] = marshal.dumps((
+                ordered_options["sequence"],
+                ordered_options["on_failure"],
+                ordered_options.get("error_method") or "ordered_oneway_error",
+                serializer.serializer_id,
+                receiver_data
+            ))
         if vargs and isinstance(vargs[0], SerializedBlob):
             # special serialization of a 'blob' that stays serialized
             data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId, methodname, serializer)
         else:
             # normal serialization of the remote call
             data = serializer.dumpsCall(objectId, methodname, vargs, kwargs)
-        if methodname in self._pyroOneway:
+        if methodname in self._pyroOneway and not (flags & protocol.FLAGS_ORDERED_ONEWAY):
             flags |= protocol.FLAGS_ONEWAY
         self._pyroSeq = (self._pyroSeq + 1) & 0xffff
         msg = protocol.SendingMessage(protocol.MSG_INVOKE, flags, self._pyroSeq, serializer.serializer_id, data, annotations=annotations)
@@ -323,7 +343,11 @@ class Proxy(object):
                     raise
                 # Do handshake.
                 serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
-                data = {"handshake": self._pyroHandshake, "object": uri.object}
+                data = {
+                    "handshake": self._pyroHandshake,
+                    "object": uri.object,
+                    "features": {"ordered-oneway": True}
+                }
                 data = serializer.dumps(data)
                 msg = protocol.SendingMessage(protocol.MSG_CONNECT, 0, self._pyroSeq, serializer.serializer_id,
                                               data, annotations=current_context.annotations)
@@ -354,6 +378,7 @@ class Proxy(object):
                     raise errors.CommunicationError(error)
                 elif msg.type == protocol.MSG_CONNECTOK:
                     self.__processMetadata(handshake_response["meta"])
+                    self._pyroServerFeatures = handshake_response.get("features", {})
                     handshake_response = handshake_response["handshake"]
                     self._pyroConnection = conn
                     self._pyroLocalSocket = conn.sock.getsockname()
@@ -455,6 +480,13 @@ class Proxy(object):
         """
         return
 
+    def _pyroOrderedOneway(self, on_failure=None, error_receiver=None, error_method=None):
+        return OrderedOnewayChannel(self, on_failure=on_failure,
+                                    error_receiver=error_receiver, error_method=error_method)
+
+    def pyroOrderedOneway(self, on_failure=None, error_receiver=None, error_method=None):
+        return self._pyroOrderedOneway(on_failure, error_receiver, error_method)
+
     def _pyroClaimOwnership(self):
         """
         The current thread claims the ownership of this proxy from another thread.
@@ -520,6 +552,68 @@ class _RemoteMethod(object):
                 if attempt >= self.__max_retries:
                     # last attempt, raise the exception
                     raise
+
+
+class OrderedOnewayChannel(object):
+    """Ordered oneway submission channel backed by a bounded server-side queue."""
+
+    def __init__(self, proxy, on_failure=None, error_receiver=None, error_method=None):
+        on_failure = on_failure or config.ORDERED_ONEWAY_ON_FAILURE
+        if on_failure not in ("stop", "continue"):
+            raise ValueError("on_failure must be 'stop' or 'continue'")
+        if error_receiver is not None and not isinstance(error_receiver, Proxy):
+            raise TypeError("error_receiver must be a Pyro Proxy")
+        self.proxy = proxy
+        self.on_failure = on_failure
+        self.error_receiver = error_receiver
+        self.error_method = error_method or "ordered_oneway_error"
+        self.sequence = 0
+        self._submit_lock = threading.Lock()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        self.error_receiver = None
+
+    def submit(self, method, *args, **kwargs):
+        methodname = self._method_name(method)
+        with self._submit_lock:
+            self.proxy._Proxy__check_owner()
+            if self.proxy._pyroConnection is None:
+                self.proxy._pyroBind()
+            feature = self.proxy._pyroServerFeatures.get("ordered-oneway")
+            if not feature:
+                raise errors.UnsupportedFeatureError("remote daemon does not support ordered oneway calls")
+            if self.on_failure != feature.get("on_failure", "stop"):
+                raise errors.PyroError("remote ordered oneway channel uses failure policy %r, not %r"
+                                        % (feature.get("on_failure", "stop"), self.on_failure))
+            self.sequence += 1
+            return self.proxy._pyroInvoke(
+                methodname, args, kwargs,
+                flags=protocol.FLAGS_ORDERED_ONEWAY,
+                ordered_options={
+                    "sequence": self.sequence,
+                    "on_failure": self.on_failure,
+                    "error_receiver": self.error_receiver,
+                    "error_method": self.error_method
+                }
+            )
+
+    @staticmethod
+    def _method_name(method):
+        if isinstance(method, str):
+            return method
+        name = getattr(method, "_RemoteMethod__name", None) or getattr(method, "__name__", None)
+        if not isinstance(name, str):
+            raise TypeError("method must be a method name or a remote method")
+        send = getattr(method, "_RemoteMethod__send", None)
+        if send is not None and send.__func__ is not Proxy._pyroInvoke:
+            raise TypeError("remote method must belong to this channel's proxy")
+        return name
 
 
 class _StreamResultIterator(object):

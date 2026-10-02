@@ -8,6 +8,8 @@ import os
 import sys
 import uuid
 import time
+import queue
+import marshal
 import socket
 import collections
 import threading
@@ -15,6 +17,7 @@ import logging
 import inspect
 import warnings
 import weakref
+from types import SimpleNamespace
 import serpent
 import ipaddress
 from typing import TypeVar, Tuple, Union, Optional, Dict, Any, Sequence, Set
@@ -199,7 +202,9 @@ class Daemon(object):
     to the appropriate objects.
     """
 
-    def __init__(self, host=None, port=0, unixsocket=None, nathost=None, natport=None, interface=DaemonObject, connected_socket=None):
+    def __init__(self, host=None, port=0, unixsocket=None, nathost=None, natport=None,
+                 interface=DaemonObject, connected_socket=None, ordered_oneway_queue_size=None,
+                 ordered_oneway_on_failure=None):
         if connected_socket:
             nathost = natport = None
         else:
@@ -258,6 +263,18 @@ class Daemon(object):
         self.create_single_instance_lock = threading.Lock()
         self.__mustshutdown.clear()
         self.methodcall_error_handler = _default_methodcall_error_handler
+        self.ordered_oneway_error_receiver = None
+        self.ordered_oneway_error_handler = None
+        if ordered_oneway_queue_size is None:
+            ordered_oneway_queue_size = config.ORDERED_ONEWAY_QUEUE_SIZE
+        if ordered_oneway_on_failure is None:
+            ordered_oneway_on_failure = config.ORDERED_ONEWAY_ON_FAILURE
+        if ordered_oneway_on_failure not in ("stop", "continue"):
+            raise errors.PyroError("invalid ORDERED_ONEWAY_ON_FAILURE configuration value")
+        self.ordered_oneway_channel = None
+        if ordered_oneway_queue_size:
+            self.ordered_oneway_channel = _OrderedOnewayChannel(
+                self, ordered_oneway_queue_size, ordered_oneway_on_failure)
 
     @property
     def sock(self):
@@ -303,6 +320,8 @@ class Daemon(object):
     def shutdown(self):
         """Cleanly terminate a daemon that is running in the requestloop."""
         log.debug("daemon shutting down")
+        if self.ordered_oneway_channel:
+            self.ordered_oneway_channel.close()
         self.streaming_responses = {}
         time.sleep(0.02)
         self.__mustshutdown.set()
@@ -346,7 +365,8 @@ class Daemon(object):
             handshake_response = self.validateHandshake(conn, data["handshake"])
             handshake_response = {
                 "handshake": handshake_response,
-                "meta": self.objectsById[core.DAEMON_NAME].get_metadata(data["object"])
+                "meta": self.objectsById[core.DAEMON_NAME].get_metadata(data["object"]),
+                "features": self._protocol_features()
             }
             data = serializer.dumps(handshake_response)
             msgtype = protocol.MSG_CONNECTOK
@@ -432,6 +452,9 @@ class Daemon(object):
             current_context.annotations = msg.annotations
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
+            if request_flags & protocol.FLAGS_ORDERED_ONEWAY:
+                self._handleOrderedOneway(conn, request_seq, serializer, msg, objId, method, vargs, kwargs)
+                return
             del msg  # invite GC to collect the object, don't wait for out-of-scope
             obj = _unpack_weakref(self.objectsById.get(objId))
             if obj is not None:
@@ -756,6 +779,8 @@ class Daemon(object):
     def close(self):
         """Close down the server and release resources"""
         self.__mustshutdown.set()
+        if self.ordered_oneway_channel:
+            self.ordered_oneway_channel.close()
         self.streaming_responses = {}
         if self.transportServer:
             log.debug("daemon closing")
@@ -779,6 +804,79 @@ class Daemon(object):
         annotations = current_context.response_annotations
         annotations.update(self.annotations())
         return annotations
+
+    def _handleOrderedOneway(self, conn, seq, serializer, protocolmsg, objId, method, vargs, kwargs):
+        request_flags = protocolmsg.flags
+        if request_flags & protocol.FLAGS_BATCH:
+            raise errors.ProtocolError("ordered oneway calls cannot be batched")
+        if request_flags & protocol.FLAGS_KEEPSERIALIZED:
+            raise errors.ProtocolError("ordered oneway calls cannot use serialized blobs")
+        channel = self.ordered_oneway_channel
+        if channel is None:
+            raise errors.DaemonError("ordered oneway calls are disabled on this daemon")
+        try:
+            sequence, on_failure, error_method, receiver_serializer_id, receiver_data = marshal.loads(
+                bytes(protocolmsg.annotations["O1WY"]))
+            if receiver_data:
+                receiver_serializer = serializers.serializers_by_id[receiver_serializer_id]
+                error_receiver = receiver_serializer.loads(bytes(receiver_data))
+            else:
+                error_receiver = self.ordered_oneway_error_receiver or getattr(
+                    self, "ordered_oneway_error_handler", None)
+        except Exception as x:
+            raise errors.ProtocolError("invalid ordered oneway request") from x
+        if on_failure != channel.on_failure:
+            raise errors.ProtocolError("ordered oneway failure policy does not match channel policy")
+        target = _unpack_weakref(self.objectsById.get(objId))
+        if target is None:
+            log.debug("unknown object requested: %s", objId)
+            raise errors.DaemonError("unknown object")
+        instance_mode = None
+        if inspect.isclass(target):
+            instance_mode = target._pyroInstancing[0]
+            if instance_mode == "session":
+                target = self._getInstance(target, conn)
+        if method in ("__getattr__", "__setattr__"):
+            raise AttributeError("ordered oneway calls do not support remote attribute access")
+        _get_attribute(target, method)
+        context = current_context.to_global()
+        context["client"] = None
+        context["annotations"] = {}
+        context["response_annotations"] = {}
+        job = _OrderedOnewayJob(
+            sequence=sequence,
+            target=target,
+            method_name=method,
+            instance_mode=instance_mode,
+            vargs=vargs,
+            kwargs=kwargs,
+            client_sock_addr=current_context.client_sock_addr,
+            context=context,
+            on_failure=on_failure,
+            error_receiver=error_receiver,
+            error_method=error_method
+        )
+        channel.submit(job)
+        data = serializer.dumps({
+            "accepted": True,
+            "sequence": sequence,
+            "queue_size": channel.qsize()
+        })
+        response = protocol.SendingMessage(protocol.MSG_RESULT, 0, seq, serializer.serializer_id, data,
+                                           annotations=self.__annotations())
+        if config.LOGWIRE:
+            protocol.log_wiredata(log, "ordered oneway acceptance response", response)
+        conn.send(response.data)
+
+    def _protocol_features(self):
+        if self.ordered_oneway_channel:
+            return {
+                "ordered-oneway": {
+                    "queue_size": self.ordered_oneway_channel.maxsize,
+                    "on_failure": self.ordered_oneway_channel.on_failure
+                }
+            }
+        return {}
 
     def __repr__(self):
         if hasattr(self, "locationStr"):
@@ -1021,3 +1119,170 @@ class _OnewayCallThread(threading.Thread):
             self.pyro_daemon.methodcall_error_handler(self.pyro_daemon, self.pyro_client_sock,
                                                       self.pyro_method, self.pyro_vargs, self.pyro_kwars,
                                                       xv)
+
+
+class _OrderedOnewayJob(object):
+    def __init__(self, sequence, target, method_name, instance_mode, vargs, kwargs,
+                 client_sock_addr, context, on_failure, error_receiver, error_method):
+        self.sequence = sequence
+        self.target = target
+        self.method_name = method_name
+        self.instance_mode = instance_mode
+        self.vargs = vargs
+        self.kwargs = kwargs
+        self.client_sock_addr = client_sock_addr
+        self.context = context
+        self.on_failure = on_failure
+        self.error_receiver = error_receiver
+        self.error_method = error_method
+
+
+class _OrderedOnewayChannel(object):
+    _sentinel = object()
+
+    def __init__(self, daemon, maxsize, on_failure):
+        if not isinstance(maxsize, int) or isinstance(maxsize, bool) or maxsize < 1:
+            raise ValueError("ordered oneway queue size must be at least 1")
+        self.daemon = daemon
+        self.maxsize = maxsize
+        self.on_failure = on_failure
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.lock = threading.Lock()
+        self.error_queue = queue.Queue(maxsize=maxsize)
+        self.error_lock = threading.Lock()
+        self.worker = None
+        self.error_worker = None
+        self.closed = False
+        self.error_closed = False
+        self.stopped = False
+
+    def submit(self, job):
+        with self.lock:
+            if self.closed:
+                raise errors.DaemonError("ordered oneway channel is closed")
+            if self.stopped:
+                raise errors.DaemonError("ordered oneway channel is stopped after a failed call")
+            try:
+                self.queue.put_nowait(job)
+            except queue.Full:
+                raise errors.OrderedOnewayQueueFullError(
+                    "ordered oneway channel queue is full (max %d)" % self.maxsize)
+            if self.worker is None or not self.worker.is_alive():
+                self.worker = threading.Thread(target=self._run, name="ordered-oneway")
+                self.worker.daemon = True
+                self.worker.start()
+
+    def qsize(self):
+        return self.queue.qsize()
+
+    def close(self):
+        with self.lock:
+            discarded = 0
+            self.closed = True
+            while True:
+                try:
+                    pending = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                if pending is self._sentinel:
+                    break
+                discarded += 1
+            if discarded:
+                log.info("ordered oneway channel discarded %d queued calls during shutdown", discarded)
+            self.queue.put_nowait(self._sentinel)
+        with self.error_lock:
+            self.error_closed = True
+            while True:
+                try:
+                    self.error_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.error_queue.put_nowait(self._sentinel)
+
+    def _run(self):
+        while True:
+            job = self.queue.get()
+            if job is self._sentinel:
+                return
+            should_stop = self._process(job)
+            if should_stop:
+                with self.lock:
+                    self.stopped = True
+                    self._drain_pending()
+                return
+
+    def _drain_pending(self):
+        while True:
+            try:
+                pending = self.queue.get_nowait()
+            except queue.Empty:
+                return
+            if pending is self._sentinel:
+                return
+
+    def _process(self, job):
+        current_context.from_global(job.context)
+        target = job.target
+        if inspect.isclass(target):
+            connection = None if job.instance_mode == "single" else SimpleNamespace(pyroInstances={})
+            target = self.daemon._getInstance(target, connection)
+        method = _get_attribute(target, job.method_name)
+        try:
+            method(*job.vargs, **job.kwargs)
+            return False
+        except Exception as xv:
+            try:
+                self.daemon.methodcall_error_handler(self.daemon, job.client_sock_addr,
+                                                     method, job.vargs, job.kwargs, xv)
+            except Exception:
+                log.exception("ordered oneway method error handler failed for call %d", job.sequence)
+            self._report_error(job, xv)
+            return job.on_failure == "stop"
+
+    def _report_error(self, job, exception):
+        report = {
+            "sequence": job.sequence,
+            "method": job.method_name,
+            "error_type": "%s.%s" % (type(exception).__module__, type(exception).__name__),
+            "error": str(exception),
+            "traceback": "".join(errors.format_traceback(type(exception), exception, exception.__traceback__))
+        }
+        receiver = job.error_receiver
+        if receiver is None:
+            log.warning("ordered oneway call %d failed and no error receiver was configured: %r",
+                        job.sequence, exception)
+            return
+        with self.error_lock:
+            if self.error_closed:
+                log.warning("ordered oneway error receiver is shutting down; error for call %d dropped",
+                            job.sequence)
+                return
+            try:
+                self.error_queue.put_nowait((receiver, job.error_method, report))
+            except queue.Full:
+                log.warning("ordered oneway error receiver queue is full; error for call %d dropped",
+                            job.sequence)
+                return
+            if self.error_worker is None or not self.error_worker.is_alive():
+                self.error_worker = threading.Thread(target=self._run_error_reports,
+                                                     name="ordered-oneway-error")
+                self.error_worker.daemon = True
+                self.error_worker.start()
+
+    def _run_error_reports(self):
+        while True:
+            item = self.error_queue.get()
+            if item is self._sentinel:
+                return
+            receiver, error_method, report = item
+            try:
+                if isinstance(receiver, client.Proxy):
+                    receiver._pyroClaimOwnership()
+                    getattr(receiver, error_method)(report)
+                else:
+                    callback = getattr(receiver, error_method, None)
+                    if callback is None:
+                        callback = receiver
+                    callback(report)
+            except Exception:
+                log.exception("ordered oneway error receiver failed for call %d", report["sequence"])

@@ -22,7 +22,8 @@ class Configuration:
         "MAX_MESSAGE_SIZE", "BROADCAST_ADDRS", "PREFER_IP_VERSION", "SERIALIZER", "SERPENT_BYTES_REPR",
         "ITER_STREAMING", "ITER_STREAM_LIFETIME", "ITER_STREAM_LINGER", "LOGFILE", "LOGLEVEL", "LOGWIRE",
         "SSL", "SSL_SERVERCERT", "SSL_SERVERKEY", "SSL_SERVERKEYPASSWD", "SSL_REQUIRECLIENTCERT",
-        "SSL_CLIENTCERT", "SSL_CLIENTKEY", "SSL_CLIENTKEYPASSWD", "SSL_CACERTS"
+        "SSL_CLIENTCERT", "SSL_CLIENTKEY", "SSL_CLIENTKEYPASSWD", "SSL_CACERTS",
+        "ORDERED_ONEWAY_QUEUE_SIZE", "ORDERED_ONEWAY_ON_FAILURE"
     ]
 
     def __init__(self):
@@ -72,6 +73,8 @@ class Configuration:
         self.SSL_CLIENTKEY = ""
         self.SSL_CLIENTKEYPASSWD = ""
         self.SSL_CACERTS = ""
+        self.ORDERED_ONEWAY_QUEUE_SIZE = 16
+        self.ORDERED_ONEWAY_ON_FAILURE = "stop"
         if use_environment:
             # environment variables overwrite config items
             prefix = "PYRO_"

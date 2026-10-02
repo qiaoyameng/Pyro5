@@ -256,6 +256,21 @@ See :ref:`decorating-pyro-class` for details on how to do this.
 See the `oneway example <https://github.com/irmen/Pyro5/tree/master/examples/oneway>`_
 for some code that demonstrates the use of oneway methods.
 
+**Ordered oneway channel (optional):**
+The regular oneway call above is unordered and uses a separate worker thread on the server.
+An ordered oneway call instead waits only for the daemon's acceptance receipt. Accepted calls are
+processed by one bounded FIFO queue, so calls are executed in submission order. If the queue is full,
+``Pyro5.errors.OrderedOnewayQueueFullError`` is raised immediately. A business failure is reported as a
+dictionary to a callback proxy method; the daemon policy determines whether later queued calls stop or
+continue. Peers that do not support the feature raise ``Pyro5.errors.UnsupportedFeatureError``::
+
+    with Pyro5.api.Proxy(error_handler_uri) as error_receiver, Pyro5.api.Proxy(service_uri) as service:
+        with service.pyroOrderedOneway(on_failure="continue",
+                                       error_receiver=error_receiver,
+                                       error_method="ordered_oneway_error") as channel:
+            channel.submit(service.configure, "x", 1)
+            channel.submit(service.start)
+
 
 .. index:: batch calls
 

@@ -114,6 +114,12 @@ to methods that are marked with ``@Pyro5.server.oneway`` on the server, will hap
 See :ref:`oneway-calls-client` for the documentation about how client code handles this.
 See the `oneway example <https://github.com/irmen/Pyro5/tree/master/examples/oneway>`_ for some code that demonstrates the use of oneway methods.
 
+The optional ordered oneway channel is enabled on the daemon by default with a bounded FIFO queue.
+Configure its size with ``ORDERED_ONEWAY_QUEUE_SIZE`` (set it to 0 to disable the feature), and its
+business-failure policy with ``ORDERED_ONEWAY_ON_FAILURE`` (``stop`` or ``continue``). Both values can
+also be passed to the ``Daemon`` constructor. You can assign a local callable to
+``daemon.ordered_oneway_error_receiver`` when no callback proxy is supplied with a call.
+
 
 Exposing classes and methods without changing existing source code
 ==================================================================
@@ -821,4 +827,3 @@ This function's signature is::
     def custom_error_handler(daemon: Daemon, client_sock: socketutil.SocketConnection,
                              method: Callable, vargs: Sequence[Any], kwargs: Dict[str, Any],
                              exception: Exception) -> None
-
