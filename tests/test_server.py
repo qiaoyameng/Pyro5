@@ -130,6 +130,68 @@ class NotEverythingExposedClass(object):
         return "you should not see this"
 
 
+@Pyro5.server.expose
+class VersionedInterfaceV1(object):
+    _pyroInterfaceVersion = "v1"
+
+    def __init__(self, counters):
+        self.counters = counters
+
+    def ping(self):
+        self.counters["v1"] += 1
+        return "v1"
+
+    @property
+    def value(self):
+        self.counters["v1"] += 1
+        return "v1-value"
+
+
+@Pyro5.server.expose
+class VersionedInterfaceV2(object):
+    _pyroInterfaceVersion = "v2"
+
+    def __init__(self, counters):
+        self.counters = counters
+
+    def ping(self):
+        self.counters["v2"] += 1
+        return "v2-ping"
+
+    def new_ping(self):
+        self.counters["v2"] += 1
+        return "v2"
+
+    @property
+    def new_value(self):
+        self.counters["v2"] += 1
+        return "v2-value"
+
+    @new_value.setter
+    def new_value(self, value):
+        self.counters["v2"] += 1
+
+
+@Pyro5.server.expose
+class UnversionedInterfaceV1(object):
+    def __init__(self, counters):
+        self.counters = counters
+
+    def ping(self):
+        self.counters["v1"] += 1
+        return "v1"
+
+
+@Pyro5.server.expose
+class UnversionedInterfaceV2(object):
+    def __init__(self, counters):
+        self.counters = counters
+
+    def ping(self):
+        self.counters["v2"] += 1
+        return "v2"
+
+
 class DaemonLoopThread(threading.Thread):
     def __init__(self, pyrodaemon):
         super().__init__()
@@ -458,6 +520,7 @@ class TestServerOnce:
         with Pyro5.client.Proxy(uri) as p:
             result = p.getDict()
             assert isinstance(result, dict), "getDict() is proxied normally"
+
             del obj # weak registration should not prevent the obj from being garbage-collected
             with pytest.raises(Pyro5.errors.DaemonError):
                 result = p.getDict()
@@ -586,6 +649,160 @@ class TestServerOnce:
             rsc = p.list()
             assert rsc == [], "r2 must now be freed due to connection loss earlier"
 
+
+
+class FakeProtocolConnection:
+    def __init__(self, daemon, object_id):
+        self.daemon = daemon
+        self.objectId = object_id
+        self.pyroInstances = {}
+        self.tracked_resources = set()
+        self.keep_open = True
+        self.server_reading_request = False
+        self.request_buffer = bytearray()
+        self.response_buffer = bytearray()
+
+        class FakeSocket:
+            def getpeername(self):
+                raise OSError("fake connection")
+
+        self.sock = FakeSocket()
+
+    def send(self, data):
+        if self.server_reading_request:
+            self.response_buffer.extend(data)
+        else:
+            self.request_buffer.extend(data)
+            self.server_reading_request = True
+            try:
+                self.daemon.handleRequest(self)
+            finally:
+                self.server_reading_request = False
+
+    def recv(self, size):
+        buffer = self.request_buffer if self.server_reading_request else self.response_buffer
+        data = bytes(buffer[:size])
+        del buffer[:size]
+        return data
+
+    def close(self):
+        pass
+
+    def family(self):
+        return "fake"
+
+
+class TestInterfaceVersion:
+    def make_daemon(self, objects):
+        daemon = Pyro5.server.Daemon.__new__(Pyro5.server.Daemon)
+        daemon.objectsById = {}
+        daemon.streaming_responses = {}
+        daemon.methodcall_error_handler = Pyro5.server._default_methodcall_error_handler
+        daemon.annotations = lambda: {}
+        daemon_object = Pyro5.server.DaemonObject(daemon)
+        daemon_object._pyroId = Pyro5.core.DAEMON_NAME
+        daemon.objectsById[Pyro5.core.DAEMON_NAME] = daemon_object
+        daemon.objectsById.update(objects)
+        return daemon
+
+    def bind_proxy(self, daemon, object_id):
+        proxy = Pyro5.client.Proxy(Pyro5.core.URI("PYRO:%s@fake:0" % object_id))
+        proxy._pyroConnection = FakeProtocolConnection(daemon, object_id)
+        metadata = daemon.objectsById[Pyro5.core.DAEMON_NAME].get_metadata(object_id)
+        proxy._pyroGetMetadata(known_metadata=metadata)
+        return proxy
+
+    def test_stale_methods_properties_and_batches_are_rejected_until_refresh(self):
+        counters = {"v1": 0, "v2": 0}
+        versioned = VersionedInterfaceV1(counters)
+        daemon = self.make_daemon({"versioned": versioned})
+        proxy = self.bind_proxy(daemon, "versioned")
+        try:
+            assert proxy._pyroInterfaceVersion == "v1"
+
+            assert proxy.ping() == "v1"
+            assert counters == {"v1": 1, "v2": 0}
+
+            daemon.objectsById["versioned"] = VersionedInterfaceV2(counters)
+
+            with pytest.raises(Pyro5.errors.StaleInterfaceError):
+                proxy.ping()
+            assert counters == {"v1": 1, "v2": 0}
+
+            with pytest.raises(Pyro5.errors.StaleInterfaceError):
+                proxy.value
+            assert counters == {"v1": 1, "v2": 0}
+
+            batch = Pyro5.client.BatchProxy(proxy)
+            batch.ping()
+            with pytest.raises(Pyro5.errors.StaleInterfaceError):
+                list(batch())
+            assert counters == {"v1": 1, "v2": 0}
+
+            proxy._pyroRefreshMetadata()
+            assert proxy._pyroInterfaceVersion == "v2"
+            assert "ping" in proxy._pyroMethods
+            assert "new_ping" in proxy._pyroMethods
+            assert "value" not in proxy._pyroAttrs
+            assert "new_value" in proxy._pyroAttrs
+
+            with pytest.raises(AttributeError, match="has no exposed attribute or method 'value'"):
+                proxy.value
+
+            with pytest.raises(Pyro5.errors.PyroError, match="item stream terminated"):
+                proxy._pyroInvoke("get_next_stream_item", ["unknown-stream"], {},
+                                  objectId=Pyro5.core.DAEMON_NAME)
+
+            assert proxy.new_ping() == "v2"
+            assert proxy.ping() == "v2-ping"
+            assert counters == {"v1": 1, "v2": 2}
+
+            assert proxy.new_value == "v2-value"
+            proxy.new_value = "changed"
+
+            batch = Pyro5.client.BatchProxy(proxy)
+            batch.new_ping()
+            batch.ping()
+            assert list(batch()) == ["v2", "v2-ping"]
+            assert counters == {"v1": 1, "v2": 6}
+        finally:
+            proxy._pyroRelease()
+
+    def test_unversioned_interfaces_use_legacy_compatibility_rule(self):
+        counters = {"v1": 0, "v2": 0}
+        daemon = self.make_daemon({"unversioned": UnversionedInterfaceV1(counters)})
+        proxy = self.bind_proxy(daemon, "unversioned")
+        try:
+            assert proxy._pyroInterfaceVersion is None
+
+            daemon.objectsById["unversioned"] = UnversionedInterfaceV2(counters)
+            assert proxy.ping() == "v2"
+            assert counters == {"v1": 0, "v2": 1}
+        finally:
+            proxy._pyroRelease()
+
+    def test_versioned_to_unversioned_replacement_is_stale_for_capable_client(self):
+        counters = {"v1": 0, "v2": 0}
+        daemon = self.make_daemon({"versioned": VersionedInterfaceV1(counters)})
+        proxy = self.bind_proxy(daemon, "versioned")
+        try:
+            daemon.objectsById["versioned"] = UnversionedInterfaceV2(counters)
+            with pytest.raises(Pyro5.errors.StaleInterfaceError):
+                proxy.ping()
+            assert counters == {"v1": 0, "v2": 0}
+        finally:
+            proxy._pyroRelease()
+
+    def test_old_client_without_version_annotation_is_accepted(self):
+        daemon = Pyro5.server.Daemon.__new__(Pyro5.server.Daemon)
+        obj = VersionedInterfaceV2({"v2": 0})
+        daemon._checkInterfaceVersion("versioned", obj, {})
+
+    def test_invalid_version_annotation_is_rejected(self):
+        daemon = Pyro5.server.Daemon.__new__(Pyro5.server.Daemon)
+        obj = VersionedInterfaceV2({"v2": 0})
+        with pytest.raises(Pyro5.errors.ProtocolError):
+            daemon._checkInterfaceVersion("versioned", obj, {"IFVR": b"\x00", "IFVC": b""})
 
 
 class TestServerThreadNoTimeout:

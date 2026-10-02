@@ -16,6 +16,7 @@ from .server import Daemon, DaemonObject, callback, expose, behavior, oneway, se
 from .nameserver import start_ns, start_ns_loop
 from .serializers import SerializerBase
 from .callcontext import current_context
+from .errors import StaleInterfaceError
 
 register_dict_to_class = SerializerBase.register_dict_to_class
 register_class_to_dict = SerializerBase.register_class_to_dict
@@ -26,5 +27,5 @@ unregister_class_to_dict = SerializerBase.unregister_class_to_dict
 __all__ = ["config", "URI", "locate_ns", "resolve", "type_meta", "current_context",
            "Proxy", "BatchProxy", "SerializedBlob", "SerializerBase",
            "Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway",
-           "start_ns", "start_ns_loop", "serve", "register_dict_to_class",
+           "StaleInterfaceError", "start_ns", "start_ns_loop", "serve", "register_dict_to_class",
            "register_class_to_dict", "unregister_dict_to_class", "unregister_class_to_dict"]

@@ -57,6 +57,11 @@ FLAGS_ITEMSTREAMRESULT = 1 << 4
 FLAGS_KEEPSERIALIZED = 1 << 5
 FLAGS_CORR_ID = 1 << 6
 
+# Interface version carried by a client when invoking an object that opted in.
+ANN_INTERFACE_VERSION = "IFVR"
+# Presence of this annotation means the client understands interface-version checks.
+ANN_INTERFACE_CAPABILITY = "IFVC"
+
 # wire protocol version. Note that if this gets updated, Pyrolite might need an update too.
 PROTOCOL_VERSION = 502
 _magic_number = 0x4dc5

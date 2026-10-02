@@ -48,6 +48,29 @@ It lets you mark the following items to be available for remote access:
 
 Anything that isn't decorated with ``@expose`` is not remotely accessible.
 
+Interface versions
+~~~~~~~~~~~~~~~~~~
+If you may replace the implementation registered for an existing object id, set a stable
+``_pyroInterfaceVersion`` attribute on each exposed implementation. Change the value whenever exposed
+methods or properties change::
+
+    @Pyro5.api.expose
+    class ServiceV1:
+        _pyroInterfaceVersion = 1
+
+        def work(self):
+            ...
+
+A proxy that obtained metadata for version 1 carries that value on later calls. After
+``daemon.register(ServiceV2(...), objectId, force=True)`` replaces the implementation, stale calls and
+properties are rejected with :py:exc:`Pyro5.errors.StaleInterfaceError` before any new method is called.
+The client must call ``_pyroRefreshMetadata()`` and issue a new call; Pyro does not replay the failed call
+automatically because methods may have side effects. Batched calls are checked as a whole before their
+first item runs.
+
+No capability is negotiated for objects without ``_pyroInterfaceVersion``; such objects, and clients
+using older Pyro versions, retain their existing compatibility behavior.
+
 .. important:: **Private methods and attributes**:
     In the spirit of being secure by default, Pyro doesn't allow remote access to anything of your class unless
     explicitly told to do so. It will never allow remote access to 'private' methods and attributes

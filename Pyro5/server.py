@@ -15,6 +15,7 @@ import logging
 import inspect
 import warnings
 import weakref
+import marshal
 import serpent
 import ipaddress
 from typing import TypeVar, Tuple, Union, Optional, Dict, Any, Sequence, Set
@@ -165,7 +166,7 @@ class DaemonObject(object):
         """
         obj = _unpack_weakref(self.daemon.objectsById.get(objectId))
         if obj is not None:
-            metadata = _get_exposed_members(obj)
+            metadata = _interface_metadata(obj)
             if not metadata["methods"] and not metadata["attrs"]:
                 # Something seems wrong: nothing is remotely exposed.
                 warnings.warn("Class %s doesn't expose any methods or attributes. Did you forget setting @expose on them?" % repr(obj))
@@ -432,9 +433,10 @@ class Daemon(object):
             current_context.annotations = msg.annotations
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
-            del msg  # invite GC to collect the object, don't wait for out-of-scope
-            obj = _unpack_weakref(self.objectsById.get(objId))
-            if obj is not None:
+            registered_obj = _unpack_weakref(self.objectsById.get(objId))
+            if registered_obj is not None:
+                self._checkInterfaceVersion(objId, registered_obj, current_context.annotations)
+                obj = registered_obj
                 if inspect.isclass(obj):
                     obj = self._getInstance(obj, conn)
                 if request_flags & protocol.FLAGS_BATCH:
@@ -496,6 +498,7 @@ class Daemon(object):
             else:
                 log.debug("unknown object requested: %s", objId)
                 raise errors.DaemonError("unknown object")
+            del msg  # invite GC to collect the object, don't wait for out-of-scope
             if request_flags & protocol.FLAGS_ONEWAY:
                 return  # oneway call, don't send a response
             else:
@@ -749,9 +752,38 @@ class Daemon(object):
             registered_object = _unpack_weakref(self.objectsById[uri.object])
         except KeyError:
             raise errors.DaemonError("object isn't registered in this daemon")
-        meta = _get_exposed_members(registered_object)
+        meta = _interface_metadata(registered_object)
         proxy._pyroGetMetadata(known_metadata=meta)
         return proxy
+
+    def _checkInterfaceVersion(self, objectId, obj, annotations):
+        """Reject a cached proxy interface before dispatching any part of a request."""
+        annotation_key = protocol.ANN_INTERFACE_VERSION
+        capability_key = protocol.ANN_INTERFACE_CAPABILITY
+        annotated_version = annotations.get(annotation_key, annotations.get(annotation_key.encode("ascii")))
+        if annotated_version is None:
+            if annotations.get(capability_key, annotations.get(capability_key.encode("ascii"))) is None:
+                # An older client, or an object that did not negotiate a version, uses the legacy rule.
+                return
+            actual_version = _get_interface_version(obj)
+            if actual_version is not None:
+                raise errors.ProtocolError("interface version annotation missing")
+            # A capability-aware client is calling an object that lost its version while it had one cached.
+            raise errors.StaleInterfaceError(
+                "stale interface version for object '%s': proxy has a cached version, "
+                "server has no version; refresh proxy metadata"
+                % objectId)
+        if annotations.get(capability_key, annotations.get(capability_key.encode("ascii"))) is None:
+            return
+        try:
+            expected_version = marshal.loads(bytes(annotated_version))
+        except Exception as x:
+            raise errors.ProtocolError("invalid interface version annotation") from x
+        actual_version = _get_interface_version(obj)
+        if expected_version != actual_version:
+            raise errors.StaleInterfaceError(
+                "stale interface version for object '%s': proxy has %r, server has %r; refresh proxy metadata"
+                % (objectId, expected_version, actual_version))
 
     def close(self):
         """Close down the server and release resources"""
@@ -955,6 +987,18 @@ def _get_exposed_members(obj: Any, only_exposed: bool = True) -> Dict[str, Set[s
     }
     __exposed_member_cache[cache_key] = result
     return result
+
+
+def _get_interface_version(obj: Any):
+    """Return the optional stable identifier of an object's remotely exposed interface."""
+    return getattr(obj, "_pyroInterfaceVersion", None)
+
+
+def _interface_metadata(obj: Any) -> Dict[str, Any]:
+    """Return exposed-member metadata without caching the instance's interface version."""
+    metadata = dict(_get_exposed_members(obj))
+    metadata["interface_version"] = _get_interface_version(obj)
+    return metadata
 
 
 def _unpack_weakref(obj: Any):

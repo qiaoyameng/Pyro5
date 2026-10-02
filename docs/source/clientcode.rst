@@ -529,3 +529,23 @@ Also this enables a properly working ``hasattr`` on the proxy, and efficient and
 if you try to access a method or attribute that is not defined or not exposed on the Pyro object.
 Lastly the direct access to attributes on the remote object is also made possible, because the proxy knows about what
 attributes are available.
+
+Interface version checks
+~~~~~~~~~~~~~~~~~~~~~~~~
+If a server object defines ``_pyroInterfaceVersion``, the proxy caches that value with the method and
+attribute metadata. The value is then carried with every normal call, batched call, and property access
+to the object. The daemon checks it before dispatching anything, including the first call in a batch.
+
+When the same object id is served by a different implementation and the cached version no longer matches,
+the call raises :py:exc:`Pyro5.errors.StaleInterfaceError` before the new implementation is entered.
+Pyro does not automatically replay the failed method because it may already have changed server state.
+After handling the error, refresh the proxy's metadata explicitly and continue with a new call::
+
+    try:
+        proxy.change_state(...)
+    except Pyro5.errors.StaleInterfaceError:
+        proxy._pyroRefreshMetadata()
+        proxy.change_state(...)   # intentionally issued again by your code
+
+Objects without ``_pyroInterfaceVersion`` keep the legacy behavior, and proxies created by older Pyro
+versions also keep working unchanged.

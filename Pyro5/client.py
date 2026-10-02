@@ -7,6 +7,7 @@ Pyro - Python Remote Objects.  Copyright by Irmen de Jong (irmen@razorvine.net).
 import sys
 import time
 import logging
+import marshal
 import serpent
 import contextlib
 from . import config, core, serializers, protocol, errors, socketutil
@@ -29,6 +30,7 @@ class Proxy(object):
     .. automethod:: _pyroBind
     .. automethod:: _pyroRelease
     .. automethod:: _pyroReconnect
+    .. automethod:: _pyroRefreshMetadata
     .. automethod:: _pyroValidateHandshake
     .. autoattribute:: _pyroTimeout
     .. attribute:: _pyroMaxRetries
@@ -53,7 +55,8 @@ class Proxy(object):
     """
     __pyroAttributes = frozenset(
         ["__getnewargs__", "__getnewargs_ex__", "__getinitargs__", "_pyroConnection", "_pyroUri",
-         "_pyroOneway", "_pyroMethods", "_pyroAttrs", "_pyroTimeout", "_pyroSeq", "_pyroLocalSocket",
+         "_pyroOneway", "_pyroMethods", "_pyroAttrs", "_pyroInterfaceVersion", "_pyroTimeout",
+         "_pyroSeq", "_pyroLocalSocket",
          "_pyroRawWireResponse", "_pyroHandshake", "_pyroMaxRetries", "_pyroSerializer",
          "_Proxy__pyroTimeout", "_Proxy__pyroOwnerThread"])
 
@@ -69,6 +72,7 @@ class Proxy(object):
         self._pyroSerializer = None  # can be set to the name of a serializer to override the global one per-proxy
         self._pyroMethods = set()  # all methods of the remote object, gotten from meta-data
         self._pyroAttrs = set()  # attributes of the remote object, gotten from meta-data
+        self._pyroInterfaceVersion = None  # interface version of the remote object, gotten from meta-data
         self._pyroOneway = set()  # oneway-methods of the remote object, gotten from meta-data
         self._pyroSeq = 0  # message sequence number
         self._pyroRawWireResponse = False  # internal switch to enable wire level responses
@@ -127,8 +131,11 @@ class Proxy(object):
 
     def __getstate__(self):
         # make sure a tuple of just primitive types are used to allow for proper serialization
-        return str(self._pyroUri), tuple(self._pyroOneway), tuple(self._pyroMethods), \
-               tuple(self._pyroAttrs), self._pyroHandshake, self._pyroSerializer
+        state = (str(self._pyroUri), tuple(self._pyroOneway), tuple(self._pyroMethods),
+                 tuple(self._pyroAttrs), self._pyroHandshake, self._pyroSerializer)
+        if self._pyroInterfaceVersion is not None:
+            state += (self._pyroInterfaceVersion,)
+        return state
 
     def __setstate__(self, state):
         self._pyroUri = core.URI(state[0])
@@ -137,6 +144,7 @@ class Proxy(object):
         self._pyroAttrs = set(state[3])
         self._pyroHandshake = state[4]
         self._pyroSerializer = state[5]
+        self._pyroInterfaceVersion = state[6] if len(state) > 6 else None
         self.__pyroTimeout = config.COMMTIMEOUT
         self._pyroMaxRetries = config.MAX_RETRIES
         self._pyroConnection = None
@@ -226,7 +234,7 @@ class Proxy(object):
         If the timeout expires before the remote method call returns,
         Pyro will raise a :exc:`Pyro5.errors.TimeoutError`""")
 
-    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None):
+    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None, interface_version=None):
         """perform the remote method call communication"""
         self.__check_owner()
         current_context.response_annotations = {}
@@ -234,7 +242,16 @@ class Proxy(object):
             self.__pyroCreateConnection()
         serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
         objectId = objectId or self._pyroConnection.objectId
-        annotations = current_context.annotations
+        annotations = dict(current_context.annotations)
+        annotations.pop(protocol.ANN_INTERFACE_VERSION, None)
+        annotations.pop(protocol.ANN_INTERFACE_CAPABILITY, None)
+        if objectId == self._pyroConnection.objectId and interface_version is not False:
+            if self._pyroInterfaceVersion is not None:
+                annotations[protocol.ANN_INTERFACE_CAPABILITY] = b""
+            effective_interface_version = (self._pyroInterfaceVersion if interface_version is None
+                                           else interface_version)
+            if effective_interface_version is not None:
+                annotations[protocol.ANN_INTERFACE_VERSION] = marshal.dumps(effective_interface_version)
         if vargs and isinstance(vargs[0], SerializedBlob):
             # special serialization of a 'blob' that stays serialized
             data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId, methodname, serializer)
@@ -404,11 +421,18 @@ class Proxy(object):
                 return  # metadata has already been retrieved as part of creating the connection
         try:
             # invoke the get_metadata method on the daemon
-            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {}, objectId=core.DAEMON_NAME)
+            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {},
+                                                        objectId=core.DAEMON_NAME,
+                                                        interface_version=False)
             self.__processMetadata(result)
         except errors.PyroError:
             log.exception("problem getting metadata")
             raise
+
+    def _pyroRefreshMetadata(self, objectId=None):
+        """Explicitly refresh the cached methods, attributes, and interface version from the server."""
+        objectId = objectId or self._pyroUri.object
+        self._pyroGetMetadata(objectId)
 
     def __processMetadata(self, metadata):
         if not metadata:
@@ -416,6 +440,7 @@ class Proxy(object):
         self._pyroOneway = set(metadata["oneway"])
         self._pyroMethods = set(metadata["methods"])
         self._pyroAttrs = set(metadata["attrs"])
+        self._pyroInterfaceVersion = metadata.get("interface_version")
         if log.isEnabledFor(logging.DEBUG):
             log.debug("from meta: methods=%s, oneway methods=%s, attributes=%s",
                       sorted(self._pyroMethods), sorted(self._pyroOneway), sorted(self._pyroAttrs))

@@ -17,6 +17,7 @@ class TestProxy:
         p1._pyroSeq = 100
         p1._pyroMaxRetries = 99
         p1._pyroRawWireResponse = True
+        p1._pyroInterfaceVersion = 42
         p2 = copy.copy(p1)
         assert p1 == p2
         assert p1 is not p2
@@ -25,6 +26,7 @@ class TestProxy:
         assert p1._pyroTimeout == p2._pyroTimeout
         assert p1._pyroMaxRetries == p2._pyroMaxRetries
         assert p1._pyroRawWireResponse == p2._pyroRawWireResponse
+        assert p1._pyroInterfaceVersion == p2._pyroInterfaceVersion
         assert p2._pyroSeq == 0
 
     def testProxyCopy(self):

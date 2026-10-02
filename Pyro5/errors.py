@@ -53,6 +53,11 @@ class DaemonError(PyroError):
     pass
 
 
+class StaleInterfaceError(PyroError):
+    """The proxy's cached interface version no longer matches the server object."""
+    pass
+
+
 class SecurityError(PyroError):
     """A security related error occurred."""
     pass
