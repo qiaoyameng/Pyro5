@@ -16,7 +16,8 @@ from typing import Union, Optional
 from . import config, errors, socketutil, serializers
 
 
-__all__ = ["URI", "DAEMON_NAME", "NAMESERVER_NAME", "resolve", "locate_ns", "type_meta"]
+__all__ = ["URI", "DAEMON_NAME", "NAMESERVER_NAME", "INTERFACE_VERSION_ANNOTATION",
+           "ONEWAY_ANNOTATION", "resolve", "locate_ns", "type_meta"]
 
 log = logging.getLogger("Pyro5.core")
 
@@ -25,6 +26,9 @@ DAEMON_NAME = "Pyro.Daemon"
 
 # standard name for the Name server itself
 NAMESERVER_NAME = "Pyro.NameServer"
+
+INTERFACE_VERSION_ANNOTATION = "IVER"
+ONEWAY_ANNOTATION = "OWAY"
 
 
 class URI(object):

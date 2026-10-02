@@ -15,6 +15,7 @@ import logging
 import inspect
 import warnings
 import weakref
+import marshal
 import serpent
 import ipaddress
 from typing import TypeVar, Tuple, Union, Optional, Dict, Any, Sequence, Set
@@ -22,7 +23,7 @@ from . import config, core, errors, serializers, socketutil, protocol, client
 from .callcontext import current_context
 from collections.abc import Callable
 
-__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "serve"]
+__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "interface_version", "serve"]
 
 log = logging.getLogger("Pyro5.server")
 
@@ -68,6 +69,25 @@ def oneway(method: Callable) -> Callable:
     """
     method._pyroOneway = True       # type: ignore
     return method
+
+
+def interface_version(version: Any) -> Callable:
+    """
+    Decorator that marks a remotely exposed class with a stable interface version.
+    Change the version whenever the remotely callable method or property interface changes.
+    """
+    try:
+        marshal.dumps(version)
+    except (ValueError, TypeError) as exc:
+        raise TypeError("interface version must be marshal-serializable") from exc
+
+    def decorate(clazz):
+        if not inspect.isclass(clazz):
+            raise TypeError("interface_version can only be applied to a class")
+        clazz._pyroInterfaceVersion = version
+        return clazz
+
+    return decorate
 
 
 _T = TypeVar("_T", bound=Union[Callable, type])
@@ -165,7 +185,7 @@ class DaemonObject(object):
         """
         obj = _unpack_weakref(self.daemon.objectsById.get(objectId))
         if obj is not None:
-            metadata = _get_exposed_members(obj)
+            metadata = _metadata_for_object(obj)
             if not metadata["methods"] and not metadata["attrs"]:
                 # Something seems wrong: nothing is remotely exposed.
                 warnings.warn("Class %s doesn't expose any methods or attributes. Did you forget setting @expose on them?" % repr(obj))
@@ -381,6 +401,27 @@ class Daemon(object):
         """
         pass
 
+    def _validateInterfaceVersion(self, registered_object, annotations, objectId):
+        """Validate a negotiated interface version before any exposed member is entered."""
+        requested_version_data = annotations.get(core.INTERFACE_VERSION_ANNOTATION)
+        if requested_version_data is None:
+            # Older clients never negotiate the version and retain their old behavior.
+            return
+        requested_version = marshal.loads(bytes(requested_version_data))
+        actual_version = _get_interface_version(registered_object)
+        if requested_version != actual_version:
+            raise errors.StaleInterfaceError(
+                "remote object '%s' interface version mismatch: client has %r, server has %r"
+                % (objectId, requested_version, actual_version),
+                expected=actual_version,
+                actual=requested_version,
+                objectId=objectId)
+
+    @staticmethod
+    def _negotiatedOneway(annotations):
+        return (core.INTERFACE_VERSION_ANNOTATION in annotations
+                and annotations.get(core.ONEWAY_ANNOTATION) == b"\x01")
+
     def handleRequest(self, conn):
         """
         Handle incoming Pyro request. Catches any exception that may occur and
@@ -433,7 +474,10 @@ class Daemon(object):
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
             del msg  # invite GC to collect the object, don't wait for out-of-scope
-            obj = _unpack_weakref(self.objectsById.get(objId))
+            registered_object = _unpack_weakref(self.objectsById.get(objId))
+            if registered_object is not None:
+                self._validateInterfaceVersion(registered_object, current_context.annotations, objId)
+            obj = registered_object
             if obj is not None:
                 if inspect.isclass(obj):
                     obj = self._getInstance(obj, conn)
@@ -442,8 +486,14 @@ class Daemon(object):
                     data = []
                     for method, vargs, kwargs in vargs:
                         method = _get_attribute(obj, method)
+                        negotiated_oneway = self._negotiatedOneway(current_context.annotations)
                         try:
-                            result = method(*vargs, **kwargs)  # this is the actual method call to the Pyro object
+                            if negotiated_oneway:
+                                _OnewayCallThread(method, vargs, kwargs, self,
+                                                  current_context.client_sock_addr).start()
+                                result = None
+                            else:
+                                result = method(*vargs, **kwargs)  # this is the actual method call to the Pyro object
                         except Exception as xv:
                             self.methodcall_error_handler(self, current_context.client_sock_addr, method, vargs, kwargs, xv)
                             xv._pyroTraceback = errors.format_traceback(detailed=config.DETAILED_TRACEBACK)
@@ -472,10 +522,14 @@ class Daemon(object):
                         data = _set_exposed_property_value(obj, vargs[0], vargs[1])
                     else:
                         method = _get_attribute(obj, method)
-                        if request_flags & protocol.FLAGS_ONEWAY:
+                        negotiated_oneway = (
+                            self._negotiatedOneway(current_context.annotations)
+                            and not (request_flags & protocol.FLAGS_ONEWAY))
+                        if request_flags & protocol.FLAGS_ONEWAY or negotiated_oneway:
                             # oneway call to be run inside its own thread, otherwise client blocking can still occur
                             #    on the next call on the same proxy
                             _OnewayCallThread(method, vargs, kwargs, self, current_context.client_sock_addr).start()
+                            data = None
                         else:
                             isCallback = getattr(method, "_pyroCallback", False)
                             try:
@@ -483,7 +537,7 @@ class Daemon(object):
                             except Exception as xv:
                                 self.methodcall_error_handler(self, current_context.client_sock_addr, method, vargs, kwargs, xv)
                                 raise
-                            if not request_flags & protocol.FLAGS_ONEWAY:
+                            if not request_flags & protocol.FLAGS_ONEWAY and not negotiated_oneway:
                                 isStream, data = self._streamResponse(data, conn)
                                 if isStream:
                                     # throw an exception as well as setting message flags
@@ -749,7 +803,7 @@ class Daemon(object):
             registered_object = _unpack_weakref(self.objectsById[uri.object])
         except KeyError:
             raise errors.DaemonError("object isn't registered in this daemon")
-        meta = _get_exposed_members(registered_object)
+        meta = _metadata_for_object(registered_object)
         proxy._pyroGetMetadata(known_metadata=meta)
         return proxy
 
@@ -904,6 +958,17 @@ def _reset_exposed_members(obj: Any, only_exposed: bool = True) -> None:
         obj = obj.__class__
     cache_key = (obj, only_exposed)
     __exposed_member_cache.pop(cache_key, None)
+
+
+def _get_interface_version(obj: Any) -> Any:
+    """Return the negotiated interface version, including versions set on an instance."""
+    return getattr(obj, "_pyroInterfaceVersion", None)
+
+
+def _metadata_for_object(obj: Any) -> Dict[str, Any]:
+    metadata = dict(_get_exposed_members(obj))
+    metadata["interface_version"] = _get_interface_version(obj)
+    return metadata
 
 
 def _get_exposed_members(obj: Any, only_exposed: bool = True) -> Dict[str, Set[str]]:

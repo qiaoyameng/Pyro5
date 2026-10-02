@@ -7,6 +7,7 @@ Pyro - Python Remote Objects.  Copyright by Irmen de Jong (irmen@razorvine.net).
 import sys
 import time
 import logging
+import marshal
 import serpent
 import contextlib
 from . import config, core, serializers, protocol, errors, socketutil
@@ -21,6 +22,8 @@ log = logging.getLogger("Pyro5.client")
 
 __all__ = ["Proxy", "BatchProxy", "SerializedBlob"]
 
+_UNSPECIFIED_INTERFACE_VERSION = object()
+
 
 class Proxy(object):
     """
@@ -29,6 +32,7 @@ class Proxy(object):
     .. automethod:: _pyroBind
     .. automethod:: _pyroRelease
     .. automethod:: _pyroReconnect
+    .. automethod:: _pyroRefreshMetadata
     .. automethod:: _pyroValidateHandshake
     .. autoattribute:: _pyroTimeout
     .. attribute:: _pyroMaxRetries
@@ -55,6 +59,7 @@ class Proxy(object):
         ["__getnewargs__", "__getnewargs_ex__", "__getinitargs__", "_pyroConnection", "_pyroUri",
          "_pyroOneway", "_pyroMethods", "_pyroAttrs", "_pyroTimeout", "_pyroSeq", "_pyroLocalSocket",
          "_pyroRawWireResponse", "_pyroHandshake", "_pyroMaxRetries", "_pyroSerializer",
+         "_pyroInterfaceVersion", "_pyroInterfaceVersionNegotiated",
          "_Proxy__pyroTimeout", "_Proxy__pyroOwnerThread"])
 
     def __init__(self, uri, connected_socket=None):
@@ -70,6 +75,8 @@ class Proxy(object):
         self._pyroMethods = set()  # all methods of the remote object, gotten from meta-data
         self._pyroAttrs = set()  # attributes of the remote object, gotten from meta-data
         self._pyroOneway = set()  # oneway-methods of the remote object, gotten from meta-data
+        self._pyroInterfaceVersion = None
+        self._pyroInterfaceVersionNegotiated = False
         self._pyroSeq = 0  # message sequence number
         self._pyroRawWireResponse = False  # internal switch to enable wire level responses
         self._pyroHandshake = "hello"  # the data object that should be sent in the initial connection handshake message
@@ -127,8 +134,11 @@ class Proxy(object):
 
     def __getstate__(self):
         # make sure a tuple of just primitive types are used to allow for proper serialization
-        return str(self._pyroUri), tuple(self._pyroOneway), tuple(self._pyroMethods), \
-               tuple(self._pyroAttrs), self._pyroHandshake, self._pyroSerializer
+        state = (str(self._pyroUri), tuple(self._pyroOneway), tuple(self._pyroMethods),
+                 tuple(self._pyroAttrs), self._pyroHandshake, self._pyroSerializer)
+        if self._pyroMethods or self._pyroAttrs:
+            state += (self._pyroInterfaceVersion,)
+        return state
 
     def __setstate__(self, state):
         self._pyroUri = core.URI(state[0])
@@ -137,6 +147,8 @@ class Proxy(object):
         self._pyroAttrs = set(state[3])
         self._pyroHandshake = state[4]
         self._pyroSerializer = state[5]
+        self._pyroInterfaceVersion = state[6] if len(state) > 6 else None
+        self._pyroInterfaceVersionNegotiated = len(state) > 6
         self.__pyroTimeout = config.COMMTIMEOUT
         self._pyroMaxRetries = config.MAX_RETRIES
         self._pyroConnection = None
@@ -226,7 +238,8 @@ class Proxy(object):
         If the timeout expires before the remote method call returns,
         Pyro will raise a :exc:`Pyro5.errors.TimeoutError`""")
 
-    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None):
+    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None,
+                    interfaceVersion=_UNSPECIFIED_INTERFACE_VERSION):
         """perform the remote method call communication"""
         self.__check_owner()
         current_context.response_annotations = {}
@@ -234,15 +247,29 @@ class Proxy(object):
             self.__pyroCreateConnection()
         serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
         objectId = objectId or self._pyroConnection.objectId
-        annotations = current_context.annotations
+        if interfaceVersion is _UNSPECIFIED_INTERFACE_VERSION:
+            interfaceVersion = self._pyroInterfaceVersion
+        annotations = dict(current_context.annotations)
+        negotiated_version = self._pyroInterfaceVersionNegotiated and interfaceVersion is not None
+        if negotiated_version:
+            annotations[core.INTERFACE_VERSION_ANNOTATION] = marshal.dumps(interfaceVersion)
         if vargs and isinstance(vargs[0], SerializedBlob):
             # special serialization of a 'blob' that stays serialized
-            data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId, methodname, serializer)
+            data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId,
+                                                   methodname, serializer)
         else:
             # normal serialization of the remote call
             data = serializer.dumpsCall(objectId, methodname, vargs, kwargs)
-        if methodname in self._pyroOneway:
-            flags |= protocol.FLAGS_ONEWAY
+        oneway_call = methodname in self._pyroOneway or (
+            flags & protocol.FLAGS_BATCH and flags & protocol.FLAGS_ONEWAY)
+        negotiated_oneway = False
+        if oneway_call:
+            if negotiated_version:
+                annotations[core.ONEWAY_ANNOTATION] = b"\x01"
+                flags &= ~protocol.FLAGS_ONEWAY
+                negotiated_oneway = True
+            else:
+                flags |= protocol.FLAGS_ONEWAY
         self._pyroSeq = (self._pyroSeq + 1) & 0xffff
         msg = protocol.SendingMessage(protocol.MSG_INVOKE, flags, self._pyroSeq, serializer.serializer_id, data, annotations=annotations)
         if config.LOGWIRE:
@@ -276,6 +303,9 @@ class Proxy(object):
                         raise data  # if you see this in your traceback, you should probably inspect the remote traceback as well
                     finally:
                         del data
+                if negotiated_oneway and not (msg.flags & protocol.FLAGS_BATCH):
+                    # Consume the dispatch acknowledgement, but never replay a side-effecting oneway call.
+                    return None
                 else:
                     return data
         except (errors.CommunicationError, KeyboardInterrupt):
@@ -382,11 +412,11 @@ class Proxy(object):
         else:
             connect_and_handshake()
         # obtain metadata if this feature is enabled, and the metadata is not known yet
-        if not self._pyroMethods and not self._pyroAttrs:
+        if not self._pyroMethods and not self._pyroAttrs and not self._pyroInterfaceVersionNegotiated:
             self._pyroGetMetadata(uri.object)
         return True
 
-    def _pyroGetMetadata(self, objectId=None, known_metadata=None):
+    def _pyroGetMetadata(self, objectId=None, known_metadata=None, force=False):
         """
         Get metadata from server (methods, attrs, oneway, ...) and remember them in some attributes of the proxy.
         Usually this will already be known due to the default behavior of the connect handshake, where the
@@ -400,15 +430,30 @@ class Proxy(object):
             except errors.PyroError:
                 log.error("problem getting metadata: cannot connect")
                 raise
-            if self._pyroMethods or self._pyroAttrs:
+            if not force and (self._pyroMethods or self._pyroAttrs):
                 return  # metadata has already been retrieved as part of creating the connection
         try:
             # invoke the get_metadata method on the daemon
-            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {}, objectId=core.DAEMON_NAME)
+            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {},
+                                                        objectId=core.DAEMON_NAME,
+                                                        interfaceVersion=None)
             self.__processMetadata(result)
         except errors.PyroError:
             log.exception("problem getting metadata")
             raise
+
+    def _pyroRefreshMetadata(self, objectId=None):
+        """Explicitly refresh the cached method, attribute, oneway and interface version metadata."""
+        self._pyroOneway.clear()
+        self._pyroMethods.clear()
+        self._pyroAttrs.clear()
+        self._pyroInterfaceVersion = None
+        self._pyroInterfaceVersionNegotiated = False
+        self._pyroGetMetadata(objectId, force=True)
+
+    def _pyroRefresh(self, objectId=None):
+        """Explicitly refresh the proxy metadata after a server-side interface replacement."""
+        self._pyroRefreshMetadata(objectId)
 
     def __processMetadata(self, metadata):
         if not metadata:
@@ -416,9 +461,12 @@ class Proxy(object):
         self._pyroOneway = set(metadata["oneway"])
         self._pyroMethods = set(metadata["methods"])
         self._pyroAttrs = set(metadata["attrs"])
+        self._pyroInterfaceVersion = metadata.get("interface_version")
+        self._pyroInterfaceVersionNegotiated = "interface_version" in metadata
         if log.isEnabledFor(logging.DEBUG):
-            log.debug("from meta: methods=%s, oneway methods=%s, attributes=%s",
-                      sorted(self._pyroMethods), sorted(self._pyroOneway), sorted(self._pyroAttrs))
+            log.debug("from meta: methods=%s, oneway methods=%s, attributes=%s, interface version=%r",
+                      sorted(self._pyroMethods), sorted(self._pyroOneway), sorted(self._pyroAttrs),
+                      self._pyroInterfaceVersion)
         if not self._pyroMethods and not self._pyroAttrs:
             raise errors.PyroError("remote object '%s' doesn't expose any methods or attributes. Did you forget setting @expose on them?" % self._pyroUri)
 
@@ -601,6 +649,11 @@ class BatchProxy(object):
         self.__calls = []
 
     def __getattr__(self, name):
+        if name.startswith("_BatchProxy__"):
+            raise AttributeError(name)
+        proxy = self.__proxy
+        if isinstance(proxy, Proxy) and not proxy._pyroMethods and not proxy._pyroAttrs:
+            proxy._pyroGetMetadata()
         return _BatchedRemoteMethod(self.__calls, name)
 
     def __enter__(self):

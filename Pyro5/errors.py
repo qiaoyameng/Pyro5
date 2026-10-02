@@ -53,6 +53,22 @@ class DaemonError(PyroError):
     pass
 
 
+class StaleInterfaceError(PyroError):
+    """The proxy metadata is for an older interface version than the server now exposes."""
+
+    def __init__(self, message=None, expected=None, actual=None, objectId=None):
+        if message is None:
+            message = "remote object interface is stale"
+        super().__init__(message)
+        self.expected = expected
+        self.actual = actual
+        self.objectId = objectId
+
+
+# Backwards-friendly name for callers that prefer the explicit mismatch terminology.
+InterfaceVersionMismatchError = StaleInterfaceError
+
+
 class SecurityError(PyroError):
     """A security related error occurred."""
     pass

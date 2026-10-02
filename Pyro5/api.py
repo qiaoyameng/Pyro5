@@ -12,7 +12,7 @@ from . import __version__
 from .configure import global_config as config
 from .core import URI, locate_ns, resolve, type_meta
 from .client import Proxy, BatchProxy, SerializedBlob
-from .server import Daemon, DaemonObject, callback, expose, behavior, oneway, serve
+from .server import Daemon, DaemonObject, callback, expose, behavior, oneway, interface_version, serve
 from .nameserver import start_ns, start_ns_loop
 from .serializers import SerializerBase
 from .callcontext import current_context
@@ -25,6 +25,6 @@ unregister_class_to_dict = SerializerBase.unregister_class_to_dict
 
 __all__ = ["config", "URI", "locate_ns", "resolve", "type_meta", "current_context",
            "Proxy", "BatchProxy", "SerializedBlob", "SerializerBase",
-           "Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway",
+           "Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "interface_version",
            "start_ns", "start_ns_loop", "serve", "register_dict_to_class",
            "register_class_to_dict", "unregister_dict_to_class", "unregister_class_to_dict"]
