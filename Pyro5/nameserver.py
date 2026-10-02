@@ -12,13 +12,15 @@ import socket
 import time
 import contextlib
 import threading
+import json
+from collections import deque
 from collections.abc import MutableMapping
 try:
     import sqlite3
 except ImportError:
     pass
 from . import config, core, socketutil, server, errors
-from .errors import NamingError, PyroError, ProtocolError
+from .errors import NamingError, PyroError, ProtocolError, StaleRevisionError
 
 
 __all__ = ["start_ns_loop", "start_ns"]
@@ -32,8 +34,65 @@ class MemoryStorage(dict):
     (because it inherits from dict it is automatically a collections.MutableMapping)
     Stopping the nameserver will make the server instantly forget about everything.
     """
-    def __init__(self, **kwargs):
+    def __init__(self, event_history_limit=1000, **kwargs):
         super(MemoryStorage, self).__init__(**kwargs)
+        if event_history_limit is not None and (
+            not isinstance(event_history_limit, int)
+            or isinstance(event_history_limit, bool)
+            or event_history_limit < 0
+        ):
+            raise ValueError("event history limit must be a non-negative integer or None")
+        self.revision = 0
+        self.event_history_limit = event_history_limit
+        self.events = deque()
+        self.oldest_event_revision = None
+        self.storage_lock = threading.RLock()
+
+    @staticmethod
+    def _make_changes(name, uri=None, metadata=None):
+        return [{"name": name, "uri": uri, "metadata": sorted(metadata or [])}]
+
+    def _append_event(self, operation, changes, batch=False):
+        self.revision += 1
+        if self.event_history_limit is None:
+            self.events.append(self._event_dict(self.revision, operation, changes, batch))
+        elif self.event_history_limit > 0:
+            if len(self.events) >= self.event_history_limit:
+                self.events.popleft()
+            self.events.append(self._event_dict(self.revision, operation, changes, batch))
+        self.oldest_event_revision = self.events[0]["revision"] if self.events else self.revision
+        return self.revision
+
+    @staticmethod
+    def _event_dict(revision, operation, changes, batch):
+        return {
+            "revision": revision,
+            "operation": operation,
+            "batch": batch,
+            "changes": changes
+        }
+
+    def register(self, name, uri, metadata):
+        with self.storage_lock:
+            operation = "replace" if name in self else "register"
+            self[name] = uri, frozenset(metadata or [])
+            self._append_event(operation, self._make_changes(name, uri, metadata))
+            return self.revision
+
+    def set_metadata(self, name, metadata):
+        with self.storage_lock:
+            uri, old_metadata = self[name]
+            self[name] = uri, frozenset(metadata or [])
+            self._append_event("set_metadata", self._make_changes(name, uri, metadata))
+            return self.revision
+
+    def remove_item(self, name):
+        with self.storage_lock:
+            if name not in self:
+                return False
+            del self[name]
+            self._append_event("remove", self._make_changes(name))
+            return True
 
     def __setitem__(self, key, value):
         uri, metadata = value
@@ -54,9 +113,49 @@ class MemoryStorage(dict):
         return {name: uri for name, (uri, metadata) in self.items()}
 
     def remove_items(self, items):
-        for item in items:
-            if item in self:
-                del self[item]
+        with self.storage_lock:
+            removed = []
+            for item in sorted(items):
+                if item in self:
+                    removed.append(item)
+                    del self[item]
+            if removed:
+                self._append_event(
+                    "remove",
+                    [{"name": name, "uri": None, "metadata": []} for name in removed],
+                    True
+                )
+            return len(removed)
+
+    def snapshot(self):
+        with self.storage_lock:
+            return self.everything(return_metadata=True), self.revision
+
+    def changes_since(self, revision):
+        with self.storage_lock:
+            if revision > self.revision:
+                raise ValueError("revision is from the future")
+            if self.oldest_event_revision is not None and revision + 1 < self.oldest_event_revision:
+                raise StaleRevisionError("revision cursor is too old; fetch a new snapshot")
+            events = []
+            for event in self.events:
+                if event["revision"] > revision:
+                    events.append({
+                        "revision": event["revision"],
+                        "operation": event["operation"],
+                        "batch": event["batch"],
+                        "changes": [dict(change) for change in event["changes"]]
+                    })
+            if revision < self.revision and not events:
+                raise StaleRevisionError("revision cursor is too old; fetch a new snapshot")
+            return events, self.revision
+
+    def clear(self):
+        with self.storage_lock:
+            super().clear()
+            self.revision = 0
+            self.events.clear()
+            self.oldest_event_revision = None
 
     def close(self):
         pass
@@ -68,12 +167,22 @@ class SqlStorage(MutableMapping):
     It is just a single (name,uri) table for the names and another table for the metadata.
     Sqlite db connection objects aren't thread-safe, so a new connection is created in every method.
     """
-    def __init__(self, dbfile):
+    def __init__(self, dbfile, event_history_limit=1000):
         if dbfile == ":memory:":
             raise ValueError("We don't support the sqlite :memory: database type. Just use the default volatile in-memory store.")
+        if event_history_limit is not None and (
+            not isinstance(event_history_limit, int)
+            or isinstance(event_history_limit, bool)
+            or event_history_limit < 0
+        ):
+            raise ValueError("event history limit must be a non-negative integer or None")
         self.dbfile = dbfile
+        self.event_history_limit = event_history_limit
         with sqlite3.connect(dbfile) as db:
             db.execute("PRAGMA foreign_keys=ON")
+            table_exists = lambda table: bool(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone())
             try:
                 db.execute("SELECT COUNT(*) FROM pyro_names").fetchone()
             except sqlite3.OperationalError:
@@ -89,6 +198,12 @@ class SqlStorage(MutableMapping):
                     self._create_schema(db)
                     db.execute("INSERT INTO pyro_names(name, uri) SELECT name, uri FROM pyro_names_old")
                     db.execute("DROP TABLE pyro_names_old")
+                if not table_exists("pyro_state"):
+                    self._create_state_schema(db)
+                elif db.execute("SELECT 1 FROM pyro_state WHERE key='oldest_event_revision'").fetchone() is None:
+                    db.execute("INSERT INTO pyro_state(key, value) VALUES('oldest_event_revision', NULL)")
+                if not table_exists("pyro_events"):
+                    self._create_events_schema(db)
             db.commit()
 
     def _create_schema(self, db):
@@ -104,6 +219,144 @@ class SqlStorage(MutableMapping):
                 metadata nvarchar NOT NULL,
                 FOREIGN KEY(object) REFERENCES pyro_names(id)
             );""")
+        self._create_state_schema(db)
+        self._create_events_schema(db)
+
+    @staticmethod
+    def _create_state_schema(db):
+        db.execute("CREATE TABLE pyro_state (key nvarchar PRIMARY KEY, value integer);")
+        db.execute("INSERT INTO pyro_state(key, value) VALUES('revision', 0)")
+        db.execute("INSERT INTO pyro_state(key, value) VALUES('oldest_event_revision', NULL)")
+
+    @staticmethod
+    def _oldest_event_revision(db):
+        return db.execute("SELECT value FROM pyro_state WHERE key='oldest_event_revision'").fetchone()[0]
+
+    @staticmethod
+    def _set_oldest_event_revision(db, revision):
+        db.execute("UPDATE pyro_state SET value=? WHERE key='oldest_event_revision'", (revision,))
+
+    @staticmethod
+    def _create_events_schema(db):
+        db.execute("""CREATE TABLE pyro_events
+            (
+                revision integer PRIMARY KEY,
+                operation nvarchar NOT NULL,
+                batch integer NOT NULL,
+                changes nvarchar NOT NULL
+            );""")
+
+    @staticmethod
+    def _current_revision(db):
+        return db.execute("SELECT value FROM pyro_state WHERE key='revision'").fetchone()[0]
+
+    @staticmethod
+    def _set_revision(db, revision):
+        db.execute("UPDATE pyro_state SET value=? WHERE key='revision'", (revision,))
+
+    @staticmethod
+    def _write_name(cursor, name, uri, metadata):
+        cursor.execute("DELETE FROM pyro_metadata WHERE object IN (SELECT id FROM pyro_names WHERE name=?)", (name,))
+        cursor.execute("DELETE FROM pyro_names WHERE name=?", (name,))
+        cursor.execute("INSERT INTO pyro_names(name, uri) VALUES(?,?)", (name, uri))
+        object_id = cursor.lastrowid
+        for item in metadata or ():
+            cursor.execute("INSERT INTO pyro_metadata(object, metadata) VALUES (?,?)", (object_id, item))
+
+    @staticmethod
+    def _load_names(db):
+        names = {}
+        rows = db.execute("SELECT id, name, uri FROM pyro_names").fetchall()
+        for dbid, name, uri in rows:
+            metadata = {m[0] for m in db.execute(
+                "SELECT metadata FROM pyro_metadata WHERE object=?", (dbid,)
+            ).fetchall()}
+            names[name] = uri, metadata
+        return names
+
+    def _append_event(self, db, operation, changes, batch=False):
+        revision = self._current_revision(db) + 1
+        db.execute(
+            "INSERT INTO pyro_events(revision, operation, batch, changes) VALUES(?,?,?,?)",
+            (revision, operation, 1 if batch else 0, json.dumps(changes))
+        )
+        self._set_revision(db, revision)
+        if self.event_history_limit == 0:
+            db.execute("DELETE FROM pyro_events")
+            oldest_revision = revision
+        elif self.event_history_limit is not None:
+            db.execute(
+                "DELETE FROM pyro_events WHERE revision < "
+                "(SELECT revision FROM pyro_events ORDER BY revision DESC LIMIT 1 OFFSET ?)",
+                (self.event_history_limit - 1,)
+            )
+            oldest_revision = db.execute("SELECT MIN(revision) FROM pyro_events").fetchone()[0]
+        else:
+            oldest_revision = db.execute("SELECT MIN(revision) FROM pyro_events").fetchone()[0]
+        self._set_oldest_event_revision(db, oldest_revision)
+        return revision
+
+    @staticmethod
+    def _decode_event(row):
+        revision, operation, batch, changes = row
+        return {
+            "revision": revision,
+            "operation": operation,
+            "batch": bool(batch),
+            "changes": json.loads(changes)
+        }
+
+    @staticmethod
+    def _make_changes(name, uri=None, metadata=None):
+        return [{"name": name, "uri": uri, "metadata": sorted(metadata or [])}]
+
+    def register(self, name, uri, metadata):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                operation = db.execute(
+                    "SELECT 1 FROM pyro_names WHERE name=?", (name,)
+                ).fetchone()
+                operation = "replace" if operation else "register"
+                cursor = db.cursor()
+                self._write_name(cursor, name, uri, metadata or ())
+                revision = self._append_event(db, operation, self._make_changes(name, uri, metadata))
+                cursor.close()
+                db.commit()
+                return revision
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in register: " + str(e))
+
+    def set_metadata(self, name, metadata):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                row = db.execute("SELECT uri FROM pyro_names WHERE name=?", (name,)).fetchone()
+                if not row:
+                    raise KeyError(name)
+                cursor = db.cursor()
+                self._write_name(cursor, name, row[0], metadata or ())
+                revision = self._append_event(db, "set_metadata", self._make_changes(name, row[0], metadata))
+                cursor.close()
+                db.commit()
+                return revision
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in set_metadata: " + str(e))
+
+    def remove_item(self, name):
+        try:
+            with sqlite3.connect(self.dbfile) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                if not db.execute("SELECT 1 FROM pyro_names WHERE name=?", (name,)).fetchone():
+                    db.rollback()
+                    return False
+                db.execute("DELETE FROM pyro_metadata WHERE object IN (SELECT id FROM pyro_names WHERE name=?)", (name,))
+                db.execute("DELETE FROM pyro_names WHERE name=?", (name,))
+                self._append_event(db, "remove", self._make_changes(name))
+                db.commit()
+                return True
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in remove_item: " + str(e))
 
     def __getattr__(self, item):
         raise NotImplementedError("SqlStorage doesn't implement method/attribute '" + item + "'")
@@ -183,6 +436,9 @@ class SqlStorage(MutableMapping):
                 db.execute("PRAGMA foreign_keys=ON")
                 db.execute("DELETE FROM pyro_metadata")
                 db.execute("DELETE FROM pyro_names")
+                db.execute("DELETE FROM pyro_events")
+                db.execute("UPDATE pyro_state SET value=0 WHERE key='revision'")
+                self._set_oldest_event_revision(db, None)
                 db.commit()
             with sqlite3.connect(self.dbfile, isolation_level=None) as db:
                 db.execute("VACUUM")  # this cannot run inside a transaction.
@@ -238,13 +494,18 @@ class SqlStorage(MutableMapping):
         try:
             with sqlite3.connect(self.dbfile) as db:
                 db.execute("PRAGMA foreign_keys=ON")
-                for item in items:
+                changes = []
+                for item in sorted(items):
                     dbid = db.execute("SELECT id FROM pyro_names WHERE name=?", (item,)).fetchone()
                     if dbid:
                         dbid = dbid[0]
                         db.execute("DELETE FROM pyro_metadata WHERE object=?", (dbid,))
                         db.execute("DELETE FROM pyro_names WHERE id=?", (dbid,))
+                        changes.append({"name": item, "uri": None, "metadata": []})
+                if changes:
+                    self._append_event(db, "remove", changes, True)
                 db.commit()
+                return len(changes)
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in remove_items: " + str(e))
 
@@ -263,6 +524,52 @@ class SqlStorage(MutableMapping):
         except sqlite3.DatabaseError as e:
             raise NamingError("sqlite error in everything: " + str(e))
 
+    def snapshot(self):
+        try:
+            db = sqlite3.connect(self.dbfile)
+            try:
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute("BEGIN")
+                names = self._load_names(db)
+                revision = self._current_revision(db)
+                db.commit()
+                return names, revision
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in snapshot: " + str(e))
+
+    def changes_since(self, revision):
+        try:
+            db = sqlite3.connect(self.dbfile)
+            try:
+                db.execute("BEGIN")
+                current_revision = self._current_revision(db)
+                if revision > current_revision:
+                    raise ValueError("revision is from the future")
+                oldest_revision = self._oldest_event_revision(db)
+                if oldest_revision is not None and revision + 1 < oldest_revision:
+                    raise StaleRevisionError("revision cursor is too old; fetch a new snapshot")
+                rows = db.execute(
+                    "SELECT revision, operation, batch, changes FROM pyro_events WHERE revision > ? ORDER BY revision",
+                    (revision,)
+                ).fetchall()
+                events = [self._decode_event(row) for row in rows]
+                if revision < current_revision and not events:
+                    raise StaleRevisionError("revision cursor is too old; fetch a new snapshot")
+                db.commit()
+                return events, current_revision
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except sqlite3.DatabaseError as e:
+            raise NamingError("sqlite error in changes_since: " + str(e))
+
     def close(self):
         pass
 
@@ -279,6 +586,12 @@ class NameServer(object):
             self.storage = MemoryStorage()
             log.debug("using volatile in-memory dict storage")
         self.lock = threading.RLock()
+
+    def _storage_supports_revisions(self):
+        return all(
+            hasattr(self.storage, name)
+            for name in ("snapshot", "changes_since", "register", "set_metadata", "remove_item", "remove_items")
+        )
 
     def count(self):
         """Returns the number of name registrations."""
@@ -315,7 +628,10 @@ class NameServer(object):
         with self.lock:
             if safe and name in self.storage:
                 raise NamingError("name already registered: " + name)
-            self.storage[name] = uri, set(metadata) if metadata is not None else None
+            metadata = set(metadata) if metadata is not None else None
+            if self._storage_supports_revisions():
+                return self.storage.register(name, uri, metadata)
+            self.storage[name] = uri, metadata
 
     def set_metadata(self, name, metadata):
         """update the metadata for an existing registration"""
@@ -327,7 +643,10 @@ class NameServer(object):
         with self.lock:
             try:
                 uri, old_meta = self.storage[name]
-                self.storage[name] = uri, set(metadata) if metadata is not None else None
+                metadata = set(metadata) if metadata is not None else None
+                if self._storage_supports_revisions():
+                    return self.storage.set_metadata(name, metadata)
+                self.storage[name] = uri, metadata
             except KeyError:
                 raise NamingError("unknown name: " + name)
 
@@ -335,6 +654,8 @@ class NameServer(object):
         """Remove a registration. returns the number of items removed."""
         if name and name != core.NAMESERVER_NAME:
             with self.lock:
+                if self._storage_supports_revisions():
+                    return 1 if self.storage.remove_item(name) else 0
                 if name in self.storage:
                     del self.storage[name]
                     return 1
@@ -344,15 +665,25 @@ class NameServer(object):
                 items = list(self.list(prefix=prefix).keys())
                 if core.NAMESERVER_NAME in items:
                     items.remove(core.NAMESERVER_NAME)
-                self.storage.remove_items(items)
-                return len(items)
+                if self._storage_supports_revisions():
+                    return self.storage.remove_items(items)
+                count = 0
+                for item in items:
+                    del self.storage[item]
+                    count += 1
+                return count
         if regex:
             with self.lock:
                 items = list(self.list(regex=regex).keys())
                 if core.NAMESERVER_NAME in items:
                     items.remove(core.NAMESERVER_NAME)
-                self.storage.remove_items(items)
-                return len(items)
+                if self._storage_supports_revisions():
+                    return self.storage.remove_items(items)
+                count = 0
+                for item in items:
+                    del self.storage[item]
+                    count += 1
+                return count
         return 0
 
     # noinspection PyNoneFunctionAssignment
@@ -390,6 +721,24 @@ class NameServer(object):
             else:
                 # just return (a copy of) everything
                 return self.storage.everything(return_metadata)
+
+    def snapshot(self):
+        """Return a metadata-enabled snapshot of all registrations and the matching revision."""
+        with self.lock:
+            if not self._storage_supports_revisions():
+                raise NotImplementedError("storage provider does not support revisioned snapshots")
+            names, revision = self.storage.snapshot()
+            return {name: (uri, set(metadata or [])) for name, (uri, metadata) in names.items()}, revision
+
+    def changes_since(self, revision):
+        """Return ordered changes after revision and the current revision.
+        Raises StaleRevisionError when the requested revision has left the history window."""
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise ValueError("revision must be a non-negative integer")
+        with self.lock:
+            if not self._storage_supports_revisions():
+                raise NotImplementedError("storage provider does not support revisioned changes")
+            return self.storage.changes_since(revision)
 
     # noinspection PyNoneFunctionAssignment
     def yplookup(self, meta_all=None, meta_any=None, return_metadata=True):

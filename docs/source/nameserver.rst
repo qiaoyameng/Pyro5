@@ -477,6 +477,30 @@ in seconds for the nameserver to check all its registrations. Choose an appropri
 allowed is 3.
 
 
+.. index:: revision, snapshots, change feed
+
+Revisioned snapshots and change feed
+====================================
+Clients that keep a local copy of the name table do not have to call :py:meth:`list` repeatedly.
+They can first call ``snapshot()`` to get every current registration (including metadata) and a
+matching revision. After that, ``changes_since(revision)`` returns the ordered changes made after
+that revision and the current revision:
+
+#. Registration of a new name produces a ``register`` change.
+#. Replacing an existing registration produces a ``replace`` change.
+#. Updating metadata produces a ``set_metadata`` change.
+#. Removing names produces one or more ``remove`` changes. Prefix or regex removal is a single
+   atomic revision containing all removed names.
+
+The revision in a snapshot is consistent with the snapshot contents. A change that occurs between
+two client calls is included in a later change response and cannot be skipped while the cursor is
+within the retained history.
+
+The server only retains a bounded amount of history. If a cursor is too old, the server raises
+:class:`Pyro5.errors.StaleRevisionError`; the client must fetch a fresh snapshot instead of
+applying a gap in the change stream.
+
+
 .. index:: scaling Name Server connections
 
 Free connections to the NS quickly

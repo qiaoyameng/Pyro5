@@ -15,7 +15,7 @@ import Pyro5.client
 import Pyro5.nsc
 import Pyro5.nameserver
 import Pyro5.socketutil
-from Pyro5.errors import CommunicationError, NamingError, PyroError
+from Pyro5.errors import CommunicationError, NamingError, PyroError, StaleRevisionError
 from Pyro5 import config
 
 
@@ -261,7 +261,7 @@ class TestNameServer0000:
 
 class TestOfflineNameServer:
     def setup_method(self):
-        self.storageProvider = Pyro5.nameserver.MemoryStorage()
+        self.storageProvider = Pyro5.nameserver.MemoryStorage(event_history_limit=1000)
 
     def teardown_method(self):
         self.clearStorage()
@@ -644,11 +644,131 @@ class TestOfflineNameServer:
         with pytest.raises(ValueError):
             ns.yplookup(meta_any={"a"}, meta_all={"a"})
 
+    @staticmethod
+    def _apply_changes(table, events):
+        for event in events:
+            for change in event["changes"]:
+                if event["operation"] == "remove":
+                    table.pop(change["name"], None)
+                else:
+                    table[change["name"]] = change["uri"], set(change["metadata"])
+
+    def testRevisionSnapshotAndChanges(self):
+        self.clearStorage()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        table, revision = ns.snapshot()
+        assert table == {}
+        assert revision == 0
+
+        assert ns.register("rev.a", "PYRO:a@host:1111", metadata={"one"}) == 1
+        assert ns.register("rev.b", "PYRO:b@host:2222") == 2
+        assert ns.register("rev.a", "PYRO:a2@host:1111", metadata={"two"}) == 3
+        assert ns.set_metadata("rev.a", {"three"}) == 4
+        assert ns.remove("rev.b") == 1
+
+        events, current_revision = ns.changes_since(revision)
+        assert [event["revision"] for event in events] == [1, 2, 3, 4, 5]
+        assert [event["operation"] for event in events] == [
+            "register", "register", "replace", "set_metadata", "remove"
+        ]
+        self._apply_changes(table, events)
+        snapshot, snapshot_revision = ns.snapshot()
+        assert current_revision == snapshot_revision == 5
+        assert table == snapshot
+        assert table["rev.a"] == ("PYRO:a2@host:1111", {"three"})
+
+    def testBatchRemoveIsOneAtomicRevision(self):
+        self.clearStorage()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        ns.register("rev.a", "PYRO:a@host:1111")
+        ns.register("rev.b", "PYRO:b@host:2222")
+        ns.register("rev.c", "PYRO:c@host:3333")
+        start_revision = ns.snapshot()[1]
+
+        assert ns.remove(prefix="rev.") == 3
+        events, current_revision = ns.changes_since(start_revision)
+        assert current_revision == start_revision + 1
+        assert len(events) == 1
+        assert events[0]["batch"] is True
+        assert events[0]["operation"] == "remove"
+        assert [change["name"] for change in events[0]["changes"]] == ["rev.a", "rev.b", "rev.c"]
+
+    def testChangesDoNotMissCallsBetweenSnapshotAndIncrementalRead(self):
+        self.clearStorage()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        table, revision = ns.snapshot()
+
+        ns.register("gap.a", "PYRO:gap-a@host:1111", metadata={"gap"})
+        events, current_revision = ns.changes_since(revision)
+        ns.register("gap.b", "PYRO:gap-b@host:2222")
+        more_events, current_revision = ns.changes_since(current_revision)
+
+        self._apply_changes(table, events + more_events)
+        snapshot, snapshot_revision = ns.snapshot()
+        assert current_revision == snapshot_revision
+        assert table == snapshot
+
+    def testStaleCursorRequiresSnapshotAndCaughtUpConsumerMatchesSnapshot(self):
+        self.clearStorage()
+        self.storageProvider.event_history_limit = 3
+        slow_ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        caught_up_ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        _, slow_revision = slow_ns.snapshot()
+        caught_up_table, caught_up_revision = caught_up_ns.snapshot()
+        slow_started = threading.Event()
+        release_slow_consumer = threading.Event()
+        original_changes_since = Pyro5.nameserver.NameServer.changes_since
+
+        def delayed_changes_since(nameserver, revision):
+            if revision == slow_revision:
+                slow_started.set()
+                release_slow_consumer.wait(1)
+            return original_changes_since(nameserver, revision)
+
+        slow_ns.changes_since = lambda revision: delayed_changes_since(slow_ns, revision)
+
+        def read_slow_changes():
+            nonlocal slow_error
+            try:
+                slow_ns.changes_since(slow_revision)
+            except StaleRevisionError as error:
+                slow_error = error
+
+        slow_error = None
+        slow_thread = threading.Thread(target=read_slow_changes)
+        slow_thread.start()
+        assert slow_started.wait(1)
+
+        caught_up_ns.register("early.0", "PYRO:early0@host:1111")
+        events, caught_up_revision = caught_up_ns.changes_since(caught_up_revision)
+        self._apply_changes(caught_up_table, events)
+
+        caught_up_ns.register("late.0", "PYRO:late0@host:1111")
+        events, caught_up_revision = caught_up_ns.changes_since(caught_up_revision)
+        self._apply_changes(caught_up_table, events)
+
+        for number in range(1, 4):
+            caught_up_ns.register("late.%d" % number, "PYRO:late%d@host:1111" % number)
+        events, caught_up_revision = caught_up_ns.changes_since(caught_up_revision)
+        self._apply_changes(caught_up_table, events)
+
+        snapshot, current_revision = caught_up_ns.snapshot()
+        assert caught_up_revision == current_revision
+        assert caught_up_table == snapshot
+
+        release_slow_consumer.set()
+        slow_thread.join(1)
+        assert not slow_thread.is_alive()
+        assert isinstance(slow_error, StaleRevisionError)
+        refreshed_snapshot, refreshed_revision = slow_ns.snapshot()
+        assert refreshed_snapshot == snapshot
+        assert refreshed_revision == current_revision
+
 
 class TestOfflineNameServerTestsSqlStorage(TestOfflineNameServer):
     def setup_method(self):
         super().setup_method()
-        self.storageProvider = Pyro5.nameserver.SqlStorage("pyro-test.sqlite")
+        self.storageProvider = Pyro5.nameserver.SqlStorage("pyro-test.sqlite", event_history_limit=1000)
 
     def teardown_method(self):
         try:
@@ -658,3 +778,20 @@ class TestOfflineNameServerTestsSqlStorage(TestOfflineNameServer):
         import glob
         for file in glob.glob("pyro-test.sqlite*"):
             os.remove(file)
+
+    def testSqlRevisionSurvivesRestartAndIsNeverReused(self):
+        self.clearStorage()
+        ns = Pyro5.nameserver.NameServer(storageProvider=self.storageProvider)
+        assert ns.register("restart.a", "PYRO:a@host:1111") == 1
+        self.storageProvider.close()
+
+        restarted_storage = Pyro5.nameserver.SqlStorage("pyro-test.sqlite", event_history_limit=1)
+        assert restarted_storage.snapshot()[1] == 1
+        restarted_ns = Pyro5.nameserver.NameServer(storageProvider=restarted_storage)
+        assert restarted_ns.register("restart.b", "PYRO:b@host:2222") == 2
+        events, current_revision = restarted_storage.changes_since(1)
+        assert current_revision == 2
+        assert [event["revision"] for event in events] == [2]
+        with pytest.raises(StaleRevisionError):
+            restarted_storage.changes_since(0)
+        restarted_storage.close()

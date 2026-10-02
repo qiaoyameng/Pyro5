@@ -48,6 +48,11 @@ class NamingError(PyroError):
     pass
 
 
+class StaleRevisionError(NamingError):
+    """A revision cursor is older than the available change history."""
+    pass
+
+
 class DaemonError(PyroError):
     """The Daemon encountered a problem."""
     pass
