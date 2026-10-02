@@ -10,6 +10,7 @@ import logging
 import serpent
 import contextlib
 from . import config, core, serializers, protocol, errors, socketutil
+from . import dedup
 from .callcontext import current_context
 try:
     from greenlet import getcurrent as get_ident
@@ -226,7 +227,7 @@ class Proxy(object):
         If the timeout expires before the remote method call returns,
         Pyro will raise a :exc:`Pyro5.errors.TimeoutError`""")
 
-    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None):
+    def _pyroInvoke(self, methodname, vargs, kwargs, flags=0, objectId=None, _dedup_disabled=False):
         """perform the remote method call communication"""
         self.__check_owner()
         current_context.response_annotations = {}
@@ -234,14 +235,25 @@ class Proxy(object):
             self.__pyroCreateConnection()
         serializer = serializers.serializers[self._pyroSerializer or config.SERIALIZER]
         objectId = objectId or self._pyroConnection.objectId
-        annotations = current_context.annotations
+        annotations = dict(current_context.annotations)
+        call_dedup_key = None if _dedup_disabled else current_context.dedup_key
+        if call_dedup_key is not None:
+            if flags & protocol.FLAGS_BATCH:
+                raise dedup.DeduplicationError("batched calls cannot use invocation deduplication")
+            if dedup.ANNOTATION in annotations:
+                raise dedup.DeduplicationError("the DEDU annotation is reserved for Pyro")
+            annotations[dedup.ANNOTATION] = dedup.encode_call_key(call_dedup_key)
         if vargs and isinstance(vargs[0], SerializedBlob):
+            if dedup.ANNOTATION in annotations:
+                raise dedup.DeduplicationError("serialized blob calls cannot use invocation deduplication")
             # special serialization of a 'blob' that stays serialized
             data, flags = self.__serializeBlobArgs(vargs, kwargs, annotations, flags, objectId, methodname, serializer)
         else:
             # normal serialization of the remote call
             data = serializer.dumpsCall(objectId, methodname, vargs, kwargs)
         if methodname in self._pyroOneway:
+            if dedup.ANNOTATION in annotations:
+                raise dedup.DeduplicationError("oneway calls cannot use invocation deduplication")
             flags |= protocol.FLAGS_ONEWAY
         self._pyroSeq = (self._pyroSeq + 1) & 0xffff
         msg = protocol.SendingMessage(protocol.MSG_INVOKE, flags, self._pyroSeq, serializer.serializer_id, data, annotations=annotations)
@@ -404,7 +416,8 @@ class Proxy(object):
                 return  # metadata has already been retrieved as part of creating the connection
         try:
             # invoke the get_metadata method on the daemon
-            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {}, objectId=core.DAEMON_NAME)
+            result = known_metadata or self._pyroInvoke("get_metadata", [objectId], {}, objectId=core.DAEMON_NAME,
+                                                        _dedup_disabled=True)
             self.__processMetadata(result)
         except errors.PyroError:
             log.exception("problem getting metadata")

@@ -20,6 +20,7 @@ class _CallContext(threading.local):
         self.annotations = {}
         self.response_annotations = {}
         self.correlation_id = None
+        self.dedup_key = None
 
     def to_global(self):
         return dict(self.__dict__)
@@ -33,6 +34,7 @@ class _CallContext(threading.local):
         self.response_annotations = values["response_annotations"]
         self.correlation_id = values["correlation_id"]
         self.client_sock_addr = values["client_sock_addr"]
+        self.dedup_key = values.get("dedup_key")
 
     def track_resource(self, resource):
         """keep a weak reference to the resource to be tracked for this connection"""

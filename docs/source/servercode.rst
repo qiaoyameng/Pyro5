@@ -115,6 +115,44 @@ See :ref:`oneway-calls-client` for the documentation about how client code handl
 See the `oneway example <https://github.com/irmen/Pyro5/tree/master/examples/oneway>`_ for some code that demonstrates the use of oneway methods.
 
 
+.. index:: deduplicated retries
+
+**Deduplicated retries**
+
+A network failure after the request reached the server means the client cannot know whether the
+method already executed. Mark methods that are safe to retry with ``@Pyro5.api.dedup`` and enable
+the protocol on the daemon::
+
+    import Pyro5.api
+
+    @Pyro5.api.expose
+    class OrderService(object):
+        @Pyro5.api.dedup
+        def reserve(self, order_id):
+            ...
+
+    class TrustedDaemon(Pyro5.api.Daemon):
+        def deduplicationScope(self, conn, handshake):
+            # Return the authenticated tenant/user/role from your handshake validator.
+            return handshake["tenant_id"]
+
+    daemon = TrustedDaemon(dedup_enabled=True)
+
+The identity of a retained call is the trusted scope, registered object id, method name and the
+client supplied call key. A retry with the same identity but different positional or keyword
+arguments is rejected. Raw serialized payload bytes are not compared and are never accepted as
+proof that the caller belongs to another scope.
+
+By default a duplicate arriving while the original method is still executing waits for its result.
+Use ``@dedup(in_flight="reject")`` to immediately report
+``Pyro5.errors.CallInProgressError`` instead, or ``wait_timeout=...`` to limit the wait.
+
+Completed results and failed calls are retained in daemon memory. Retention is limited by both
+time and number of records. The daemon does not persist records, so after a daemon restart it does
+not promise that old retries were executed or not executed; at-least-once safety is only guaranteed
+while the record is still retained.
+
+
 Exposing classes and methods without changing existing source code
 ==================================================================
 
@@ -821,4 +859,3 @@ This function's signature is::
     def custom_error_handler(daemon: Daemon, client_sock: socketutil.SocketConnection,
                              method: Callable, vargs: Sequence[Any], kwargs: Dict[str, Any],
                              exception: Exception) -> None
-

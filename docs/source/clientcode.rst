@@ -465,6 +465,26 @@ You can also do this on a pre-proxy basis by setting the max retries property on
 Be careful to use when remote functions have a side effect (e.g.: calling twice results in error)!
 See the `autoretry example <https://github.com/irmen/Pyro5/tree/master/examples/autoretry>`_ for more details.
 
+For methods that the server explicitly marked as deduplicatable, provide a stable call key around
+the original call and every retry of that exact operation::
+
+    import uuid
+    import Pyro5.api
+
+    call_id = str(uuid.uuid4())
+    try:
+        with Pyro5.api.call_key(call_id):
+            result = proxy.reserve(order)
+    except Pyro5.errors.CommunicationError:
+        proxy._pyroRelease()
+        with Pyro5.api.call_key(call_id):
+            result = proxy.reserve(order)
+
+Generate a new key for every distinct operation. Reusing a key with different arguments, a
+different method/object, or outside the trusted caller scope returned by the server's handshake
+validation is rejected. One-way, batched, serialized-blob, attribute and streaming calls do not
+support the protocol. The guarantee applies only while the running daemon still retains the record.
+
 .. index::
     double: reconnecting; automatic
 

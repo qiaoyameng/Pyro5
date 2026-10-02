@@ -107,6 +107,12 @@ THREADPOOL_SIZE_MIN       int     4                       For the thread pool se
 SERIALIZER                str     serpent                 The wire protocol serializer to use for clients/proxies (one of: serpent, json, marshal, msgpack)
 LOGWIRE                   bool    False                   If wire-level message data should be written to the logfile (you may want to disable COMPRESSION)
 MAX_RETRIES               int     0                       Automatically retry network operations for some exceptions (timeout / connection closed), be careful to use when remote functions have a side effect (e.g.: calling twice results in error)
+DEDUP_ENABLED             bool    False                   Enable the daemon side of opt-in invocation deduplication
+DEDUP_RESULT_TTL          float   300.0                   Seconds to retain completed deduplicated invocation results (0=do not retain after completion)
+DEDUP_FAILURE_TTL         float   300.0                   Seconds to retain failed deduplicated invocations so retries can replay the failure (0=do not retain after failure)
+DEDUP_MAX_RECORDS         int     10000                   Maximum number of completed or failed deduplicated invocation records retained in daemon memory
+DEDUP_KEY_MAX_LENGTH      int     256                     Maximum length of a client supplied deduplication call key
+DEDUP_WAIT_TIMEOUT        float   30.0                    Default maximum number of seconds a duplicate waits for an in-flight marked method to finish
 ITER_STREAMING            bool    True                    Should iterator item streaming support be enabled in the server (default=True)
 ITER_STREAM_LIFETIME      float   0.0                     Maximum lifetime in seconds for item streams (default=0, no limit - iterator only stops when exhausted or client disconnects)
 ITER_STREAM_LINGER        float   30.0                    Linger time in seconds to keep an item stream alive after proxy disconnects (allows to reconnect to stream)

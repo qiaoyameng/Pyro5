@@ -58,6 +58,16 @@ class SecurityError(PyroError):
     pass
 
 
+class DeduplicationError(PyroError):
+    """A call could not be deduplicated."""
+    pass
+
+
+class CallInProgressError(DeduplicationError):
+    """A duplicate call arrived while the original call was still running."""
+    pass
+
+
 class SerializeError(ProtocolError):
     """Something went wrong while (de)serializing data."""
     pass

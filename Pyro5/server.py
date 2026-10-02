@@ -19,10 +19,12 @@ import serpent
 import ipaddress
 from typing import TypeVar, Tuple, Union, Optional, Dict, Any, Sequence, Set
 from . import config, core, errors, serializers, socketutil, protocol, client
+from . import dedup as dedup_protocol
+from .dedup import dedup
 from .callcontext import current_context
 from collections.abc import Callable
 
-__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "serve"]
+__all__ = ["Daemon", "DaemonObject", "callback", "expose", "behavior", "oneway", "dedup", "serve"]
 
 log = logging.getLogger("Pyro5.server")
 
@@ -199,7 +201,9 @@ class Daemon(object):
     to the appropriate objects.
     """
 
-    def __init__(self, host=None, port=0, unixsocket=None, nathost=None, natport=None, interface=DaemonObject, connected_socket=None):
+    def __init__(self, host=None, port=0, unixsocket=None, nathost=None, natport=None, interface=DaemonObject,
+                 connected_socket=None, dedup_enabled=None, dedup_result_ttl=None,
+                 dedup_failure_ttl=None, dedup_max_records=None, deduplication_scope=None):
         if connected_socket:
             nathost = natport = None
         else:
@@ -256,6 +260,17 @@ class Daemon(object):
         self.housekeeper_lock = threading.Lock()
         self._disconnect_lock = threading.Lock()
         self.create_single_instance_lock = threading.Lock()
+        if dedup_enabled is None:
+            dedup_enabled = config.DEDUP_ENABLED
+        self._dedup_enabled = bool(dedup_enabled)
+        self._deduplication_scope = deduplication_scope
+        self.deduplication_store = None
+        if self._dedup_enabled:
+            self.deduplication_store = dedup_protocol.DeduplicationStore(
+                completed_ttl=dedup_result_ttl,
+                failed_ttl=dedup_failure_ttl,
+                max_records=dedup_max_records
+            )
         self.__mustshutdown.clear()
         self.methodcall_error_handler = _default_methodcall_error_handler
 
@@ -344,6 +359,7 @@ class Daemon(object):
             serializer = serializers.serializers_by_id[serializer_id]
             data = serializer.loads(msg.data)
             handshake_response = self.validateHandshake(conn, data["handshake"])
+            conn.pyro_dedup_scope = self.deduplicationScope(conn, data)
             handshake_response = {
                 "handshake": handshake_response,
                 "meta": self.objectsById[core.DAEMON_NAME].get_metadata(data["object"])
@@ -374,6 +390,23 @@ class Daemon(object):
         """
         return "hello"
 
+    def deduplicationScope(self, conn, handshake):
+        """
+        Return the trusted caller scope for invocation deduplication.
+        Return None for callers that are not trusted to use deduplication.
+        """
+        if self._deduplication_scope is not None:
+            return self._validate_dedup_scope(self._deduplication_scope(conn, handshake))
+        return None
+
+    @staticmethod
+    def _validate_dedup_scope(scope):
+        if scope is None:
+            return None
+        if not isinstance(scope, str) or not scope:
+            raise errors.SecurityError("deduplication scope must be a non-empty string or None")
+        return scope
+
     def clientDisconnect(self, conn):
         """
         Override this to handle a client disconnect.
@@ -392,6 +425,9 @@ class Daemon(object):
         request_serializer_id = serializers.MarshalSerializer.serializer_id
         wasBatched = False
         isCallback = False
+        dedup_token = None
+        dedup_key = None
+        serializer = None
         try:
             msg = protocol.recv_stub(conn, [protocol.MSG_INVOKE, protocol.MSG_PING])
         except errors.CommunicationError as x:
@@ -402,6 +438,10 @@ class Daemon(object):
             request_flags = msg.flags
             request_seq = msg.seq
             request_serializer_id = msg.serializer_id
+            if dedup_protocol.ANNOTATION in msg.annotations and (
+                    request_flags & (protocol.FLAGS_BATCH | protocol.FLAGS_KEEPSERIALIZED | protocol.FLAGS_ONEWAY)):
+                raise dedup_protocol.DeduplicationError(
+                    "only normal request-response calls support invocation deduplication")
             if msg.flags & protocol.FLAGS_CORR_ID:
                 current_context.correlation_id = uuid.UUID(bytes=msg.corr_id)
             else:
@@ -422,6 +462,8 @@ class Daemon(object):
             else:
                 # normal deserialization of remote call arguments
                 objId, method, vargs, kwargs = serializer.loadsCall(msg.data)
+            if dedup_protocol.ANNOTATION in msg.annotations:
+                dedup_key = dedup_protocol.decode_call_key(msg.annotations[dedup_protocol.ANNOTATION])
             current_context.client = conn
             try:
                 # store, because on oneway calls, socket will be disconnected:
@@ -432,7 +474,6 @@ class Daemon(object):
             current_context.annotations = msg.annotations
             current_context.msg_flags = msg.flags
             current_context.serializer_id = msg.serializer_id
-            del msg  # invite GC to collect the object, don't wait for out-of-scope
             obj = _unpack_weakref(self.objectsById.get(objId))
             if obj is not None:
                 if inspect.isclass(obj):
@@ -455,6 +496,9 @@ class Daemon(object):
                 else:
                     # normal single method call
                     if method == "__getattr__":
+                        if dedup_key is not None:
+                            raise dedup_protocol.DeduplicationError(
+                                "attribute access cannot use invocation deduplication")
                         # special case for direct attribute access (only exposed @properties are accessible)
                         data = _get_exposed_property_value(obj, vargs[0])
                         if not request_flags & protocol.FLAGS_ONEWAY:
@@ -468,10 +512,41 @@ class Daemon(object):
                                                             annotations=ann, flags=protocol.FLAGS_ITEMSTREAMRESULT)
                                 return
                     elif method == "__setattr__":
+                        if dedup_key is not None:
+                            raise dedup_protocol.DeduplicationError(
+                                "attribute access cannot use invocation deduplication")
                         # special case for direct attribute access (only exposed @properties are accessible)
                         data = _set_exposed_property_value(obj, vargs[0], vargs[1])
                     else:
                         method = _get_attribute(obj, method)
+                        dedup_options = getattr(method, "_pyroDedup", None)
+                        if dedup_key is not None:
+                            if dedup_options is None:
+                                raise dedup_protocol.DeduplicationError(
+                                    "method is not marked as supporting deduplication")
+                            if not self._dedup_enabled or self.deduplication_store is None:
+                                raise dedup_protocol.DeduplicationError("daemon has invocation deduplication disabled")
+                            scope = getattr(conn, "pyro_dedup_scope", None)
+                            if scope is None:
+                                raise errors.SecurityError("caller is not within a trusted deduplication scope")
+                            identity = (scope, objId, method.__name__, dedup_key)
+                            wait_timeout = dedup_options[1]
+                            if wait_timeout is None:
+                                wait_timeout = config.DEDUP_WAIT_TIMEOUT
+                            dedup_token = self.deduplication_store.begin(
+                                identity, (vargs, kwargs), dedup_options[0], wait_timeout)
+                            if dedup_token.replayed:
+                                try:
+                                    payload, failed, response_serializer_id = dedup_token.response()
+                                    replay_msg = protocol.SendingMessage(
+                                        protocol.MSG_RESULT,
+                                        protocol.FLAGS_EXCEPTION if failed else 0,
+                                        request_seq, response_serializer_id, payload,
+                                        annotations=self.__annotations())
+                                    conn.send(replay_msg.data)
+                                    return
+                                finally:
+                                    dedup_token.release()
                         if request_flags & protocol.FLAGS_ONEWAY:
                             # oneway call to be run inside its own thread, otherwise client blocking can still occur
                             #    on the next call on the same proxy
@@ -483,16 +558,22 @@ class Daemon(object):
                             except Exception as xv:
                                 self.methodcall_error_handler(self, current_context.client_sock_addr, method, vargs, kwargs, xv)
                                 raise
-                            if not request_flags & protocol.FLAGS_ONEWAY:
-                                isStream, data = self._streamResponse(data, conn)
-                                if isStream:
-                                    # throw an exception as well as setting message flags
-                                    # this way, it is backwards compatible with older pyro versions.
-                                    exc = errors.ProtocolError("result of call is an iterator")
-                                    ann = {"STRM": data.encode()} if data else {}
-                                    self._sendExceptionResponse(conn, request_seq, serializer.serializer_id, exc, None,
-                                                                annotations=ann, flags=protocol.FLAGS_ITEMSTREAMRESULT)
+                            isStream, data = self._streamResponse(data, conn)
+                            if isStream:
+                                if dedup_token is not None:
+                                    exc = errors.ProtocolError("streaming results cannot be deduplicated")
+                                    payload = serializer.dumps(exc)
+                                    dedup_token.fail(payload, serializer.serializer_id)
+                                    msg = protocol.SendingMessage(protocol.MSG_RESULT, protocol.FLAGS_EXCEPTION,
+                                                                  request_seq, serializer.serializer_id, payload,
+                                                                  annotations=self.__annotations())
+                                    conn.send(msg.data)
                                     return
+                                exc = errors.ProtocolError("result of call is an iterator")
+                                ann = {"STRM": data.encode()} if data else {}
+                                self._sendExceptionResponse(conn, request_seq, serializer.serializer_id, exc, None,
+                                                            annotations=ann, flags=protocol.FLAGS_ITEMSTREAMRESULT)
+                                return
             else:
                 log.debug("unknown object requested: %s", objId)
                 raise errors.DaemonError("unknown object")
@@ -500,6 +581,8 @@ class Daemon(object):
                 return  # oneway call, don't send a response
             else:
                 data = serializer.dumps(data)
+                if dedup_token is not None:
+                    dedup_token.complete(data, serializer.serializer_id)
                 response_flags = 0
                 if wasBatched:
                     response_flags |= protocol.FLAGS_BATCH
@@ -510,6 +593,16 @@ class Daemon(object):
                     protocol.log_wiredata(log, "daemon wiredata sending", msg)
                 conn.send(msg.data)
         except Exception as xv:
+            if dedup_token is not None and not dedup_token.replayed and not dedup_token._finished:
+                error_serializer = serializer or serializers.MarshalSerializer
+                error_value = xv
+                try:
+                    error_value._pyroTraceback = errors.format_traceback(detailed=config.DETAILED_TRACEBACK)
+                    payload = error_serializer.dumps(error_value)
+                except Exception:
+                    error_value = errors.PyroError("error serializing exception")
+                    payload = error_serializer.dumps(error_value)
+                dedup_token.fail(payload, error_serializer.serializer_id)
             msg = getattr(xv, "pyroMsg", None)
             if msg:
                 request_seq = msg.seq
@@ -565,6 +658,8 @@ class Daemon(object):
                             linger_period = time.time() - info[2]
                             if linger_period > config.ITER_STREAM_LINGER:
                                 del self.streaming_responses[streamId]
+            if self.deduplication_store is not None:
+                self.deduplication_store.prune()
             self.housekeeping()
 
     def housekeeping(self):
