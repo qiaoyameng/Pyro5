@@ -8,6 +8,8 @@ The exception hierarchy is as follows::
       +-- PyroError
             |
             +-- NamingError
+                  |
+                  +-- StaleCursorError
             +-- DaemonError
             +-- SecurityError
             +-- CommunicationError

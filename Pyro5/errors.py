@@ -48,6 +48,11 @@ class NamingError(PyroError):
     pass
 
 
+class StaleCursorError(NamingError):
+    """The requested change cursor is older than the available event history."""
+    pass
+
+
 class DaemonError(PyroError):
     """The Daemon encountered a problem."""
     pass
